@@ -106,6 +106,15 @@ class AudioEffectsManager {
     return this.inputNode;
   }
 
+  connectSourceStream(mediaStream) {
+    // Connect a raw MediaStream into the Tone.js graph correctly
+    const audioContext = Tone.context.rawContext || Tone.context._context;
+    const source = audioContext.createMediaStreamSource(mediaStream);
+    // Tone.Gain exposes its underlying AudioNode via .input
+    const toneInput = this.inputNode.input;
+    source.connect(toneInput);
+  }
+
   async applyEffect(effect, peerConnections) {
     if (!this.inputNode) return;
     const now = Date.now();
@@ -115,46 +124,67 @@ class AudioEffectsManager {
 
     const audioContext = Tone.context.rawContext || Tone.context._context;
     const dest = audioContext.createMediaStreamDestination();
+    // Wrap native dest so Tone.js can chain into it
+    const toneDestNode = Tone.context.createGain();
+    toneDestNode.connect(dest);
+    const toneDest = { input: toneDestNode };
 
     this.dynamicNodes.forEach(n => { try { n.disconnect(); if (n.dispose) n.dispose(); } catch(e){} });
     this.dynamicNodes = [];
-    this.inputNode.disconnect();
+    try { this.inputNode.disconnect(); } catch(e) {}
 
     switch (effect) {
       case 'underwater':
         this.filter.type = 'lowpass';
         this.filter.frequency.value = 500;
         this.reverb.wet.value = 0.5;
-        this.inputNode.chain(this.filter, this.reverb, dest);
+        this.inputNode.connect(this.filter);
+        this.filter.connect(this.reverb);
+        this.reverb.connect(toneDest.input);
         break;
-      case 'cave':
+      case 'cave': {
         const caveDelay = new Tone.FeedbackDelay('0.15', 0.35);
         const caveReverb = new Tone.Reverb({ decay: 5, wet: 0.6 });
-        await caveReverb.ready;
+        await caveReverb.generate();
         this.dynamicNodes.push(caveDelay, caveReverb);
-        this.inputNode.chain(caveReverb, caveDelay, dest);
+        this.inputNode.connect(caveReverb);
+        caveReverb.connect(caveDelay);
+        caveDelay.connect(toneDest.input);
         break;
-      case 'mountain':
+      }
+      case 'mountain': {
         const mtnDelay = new Tone.FeedbackDelay('0.25', 0.25);
         const mtnReverb = new Tone.Reverb({ decay: 4, wet: 0.35 });
-        await mtnReverb.ready;
+        await mtnReverb.generate();
         this.dynamicNodes.push(mtnDelay, mtnReverb);
-        this.inputNode.chain(mtnReverb, mtnDelay, dest);
+        this.inputNode.connect(mtnReverb);
+        mtnReverb.connect(mtnDelay);
+        mtnDelay.connect(toneDest.input);
         break;
-      case 'buried':
+      }
+      case 'buried': {
         const muffled = new Tone.Filter({ type: 'lowpass', frequency: 250, Q: 2 });
         const buriedReverb = new Tone.Reverb({ decay: 4, wet: 0.7 });
-        await buriedReverb.ready;
+        await buriedReverb.generate();
         this.dynamicNodes.push(muffled, buriedReverb);
-        this.inputNode.chain(muffled, buriedReverb, dest);
+        this.inputNode.connect(muffled);
+        muffled.connect(buriedReverb);
+        buriedReverb.connect(toneDest.input);
         break;
-      default:
+      }
+      default: {
         const gate = new Tone.Gate(-45, 0.15);
         const hp = new Tone.Filter({ type: 'highpass', frequency: 80 });
         const lp = new Tone.Filter({ type: 'lowpass', frequency: 8000 });
         const comp = new Tone.Compressor(-28, 2.5);
         this.dynamicNodes.push(gate, hp, lp, comp);
-        this.inputNode.chain(hp, gate, lp, comp, dest);
+        this.inputNode.connect(hp);
+        hp.connect(gate);
+        gate.connect(lp);
+        lp.connect(comp);
+        comp.connect(toneDest.input);
+        break;
+      }
     }
 
     this.processedStream = dest.stream;
@@ -206,10 +236,9 @@ class MicrophoneManager {
     this.mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
     this.currentDeviceId = deviceId;
 
-    const audioContext = Tone.context.rawContext || Tone.context._context;
-    const source = audioContext.createMediaStreamSource(this.mediaStream);
-    const inputNode = this.audioEffects.createInputNode(micVolume);
-    source.connect(inputNode.input || inputNode);
+    this.audioEffects.createInputNode(micVolume);
+    // Use the dedicated method that correctly connects Web Audio API source into Tone.js
+    this.audioEffects.connectSourceStream(this.mediaStream);
     await this.audioEffects.applyEffect('none', null);
   }
 
@@ -400,6 +429,7 @@ class ParticipantsManager {
     const pending = this.pendingNodes.get(gamertag);
     if (pending) {
       p.setAudioNodes(pending.gainNode, pending.audioElement);
+      p.updateVolume(1); // default to audible until Minecraft adjusts distance volume
       this.pendingNodes.delete(gamertag);
     }
     this.participants.set(gamertag, p);
@@ -484,7 +514,7 @@ class WebRTCManager {
       const audio = document.createElement('audio');
       audio.srcObject = event.streams[0];
       audio.autoplay = true;
-      audio.volume = 0;
+      audio.volume = 1;
       audio.id = `audio-${remoteGt}`;
       audio.style.display = 'none';
       document.body.appendChild(audio);
@@ -493,12 +523,17 @@ class WebRTCManager {
         audio.setSinkId(this.outputDeviceId).catch(() => {});
       }
 
-      audio.play().catch(() => {});
+      audio.play().catch((err) => {
+        console.warn('audio.play() failed, will retry on user gesture:', err);
+        const resume = () => { audio.play().catch(() => {}); document.removeEventListener('click', resume); };
+        document.addEventListener('click', resume);
+      });
 
       const p = this.participantsManager.get(remoteGt);
       if (p) {
         p.setAudioNodes(null, audio);
-        p.updateVolume(0);
+        // Only set volume to 1 here; Minecraft integration will adjust if data is available
+        p.updateVolume(1);
       } else {
         this.participantsManager.addPendingNode(remoteGt, { gainNode: null, audioElement: audio });
       }
@@ -520,7 +555,27 @@ class WebRTCManager {
     };
 
     const stream = this.audioEffects.getProcessedStream();
-    if (stream) stream.getTracks().forEach(t => pc.addTrack(t, stream));
+    if (stream) {
+      stream.getTracks().forEach(t => pc.addTrack(t, stream));
+    } else {
+      // Fallback: add raw mic stream if audio effects haven't initialized yet
+      const rawStream = this.audioEffects.inputNode?._context
+        ? null
+        : null;
+      // Schedule a re-add once the processed stream is ready
+      const waitForStream = setInterval(() => {
+        const s = this.audioEffects.getProcessedStream();
+        if (s && pc.signalingState !== 'closed') {
+          clearInterval(waitForStream);
+          const senders = pc.getSenders();
+          if (senders.length === 0) {
+            s.getTracks().forEach(t => pc.addTrack(t, s));
+          }
+        }
+      }, 100);
+      // Give up after 5 seconds
+      setTimeout(() => clearInterval(waitForStream), 5000);
+    }
 
     this.peerConnections.set(remoteGt, pc);
     return pc;
@@ -637,8 +692,8 @@ class MinecraftIntegration {
 
     if (!myPlayer) {
       if (wasInGame) console.log('Disconnected from Minecraft server');
-      this.micManager.setEnabled(false);
-      this.participantsManager.forEach(p => { if (!p.isSelf) p.updateVolume(0); });
+      // Don't mute mic or audio — just note we're not in game
+      // (user may still want to hear/talk to others outside of game)
       return;
     }
 
