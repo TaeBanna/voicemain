@@ -27,8 +27,8 @@ class VoiceDetector {
       this.audioContext = new (window.AudioContext ||
         window.webkitAudioContext)();
       this.analyser = this.audioContext.createAnalyser();
-      this.analyser.fftSize = 512;
-      this.analyser.smoothingTimeConstant = 0.6;
+      this.analyser.fftSize = 2048;
+      this.analyser.smoothingTimeConstant = 0.8;
 
       this.microphone = this.audioContext.createMediaStreamSource(this.stream);
       this.microphone.connect(this.analyser);
@@ -58,26 +58,25 @@ class VoiceDetector {
   }
 
   startDetection() {
-    // 80ms interval (~12 checks/sec) is plenty for voice detection
     this.detectionInterval = setInterval(() => {
       const volumeDb = this.getVolumeDb();
       const now = Date.now();
-      const prevTalking = this.isTalking;
 
       if (volumeDb > this.threshold) {
         this.lastSpeakTime = now;
-        this.isTalking = true;
+
+        if (!this.isTalking) {
+          this.isTalking = true;
+          this.notifyChange(true, volumeDb);
+        }
       } else if (volumeDb < this.silenceThreshold && this.isTalking) {
         if (now - this.lastSpeakTime > this.silenceDelay) {
           this.isTalking = false;
+          this.notifyChange(false, volumeDb);
         }
       }
-
-      // Only notify when state actually changes
-      if (this.isTalking !== prevTalking) {
-        this.notifyChange(this.isTalking, volumeDb);
-      }
-    }, 80);
+      this.notifyChange(this.isTalking, volumeDb);
+    });
   }
 
   notifyChange(isTalking, volumeDb) {
@@ -142,48 +141,22 @@ class AudioEffectsManager {
   }
 
   async init() {
-    // Native Web Audio API — no Tone.js needed here
-    this._audioCtx = null; // lazy init on first use
+    this.reverb = new Tone.Reverb({ decay: 2.5, wet: 0.35 });
+    this.filter = new Tone.Filter({ type: "lowpass", frequency: 1200 });
+    this.chorus = new Tone.Chorus({
+      frequency: 1.5,
+      delayTime: 3.5,
+      depth: 0.7,
+      wet: 0.25,
+    });
+    await this.reverb.generate();
     console.log("✓ Audio effects initialized");
   }
 
-  _getAudioCtx() {
-    if (!this._audioCtx) {
-      this._audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    }
-    return this._audioCtx;
-  }
-
   createInputNode(micVolume = 1.0) {
-    const ctx = this._getAudioCtx();
-    this.inputNode = ctx.createGain();
-    this.inputNode.gain.value = micVolume;
+    // CRÍTICO: Usar Tone.Gain en lugar de nodo nativo
+    this.inputNode = new Tone.Gain(micVolume);
     return this.inputNode;
-  }
-
-  // Helper: create convolver reverb from noise buffer
-  _makeReverb(ctx, duration, decay, wet) {
-    const rate = ctx.sampleRate;
-    const len = rate * duration;
-    const buf = ctx.createBuffer(2, len, rate);
-    for (let c = 0; c < 2; c++) {
-      const d = buf.getChannelData(c);
-      for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay);
-    }
-    const conv = ctx.createConvolver();
-    conv.buffer = buf;
-    // Wet/dry mix via gain nodes
-    const dryGain = ctx.createGain(); dryGain.gain.value = 1 - wet;
-    const wetGain = ctx.createGain(); wetGain.gain.value = wet;
-    const out = ctx.createGain();
-    // wiring done by caller; return nodes for chaining
-    return { conv, dryGain, wetGain, out,
-      connect(src, dest) {
-        src.connect(dryGain); dryGain.connect(out);
-        src.connect(conv); conv.connect(wetGain); wetGain.connect(out);
-        out.connect(dest);
-      }
-    };
   }
 
   async applyEffect(effect, peerConnections) {
@@ -192,93 +165,133 @@ class AudioEffectsManager {
       return;
     }
 
+    // CRÍTICO: Throttle para evitar cambios muy frecuentes
     const now = Date.now();
-    if (this.currentEffect === effect && this.processedStream !== null) return;
-    if (this.processedStream !== null && now - this.lastEffectChange < 1000) return;
+    if (this.currentEffect === effect && this.processedStream !== null) {
+      return;
+    }
+
+    // Limitar a 1 cambio por segundo
+    if (this.processedStream !== null && now - this.lastEffectChange < 1000) {
+      return;
+    }
     this.lastEffectChange = now;
 
     console.log(`🎨 Changing effect: ${this.currentEffect} → ${effect}`);
 
-    const ctx = this._getAudioCtx();
-    const dest = ctx.createMediaStreamDestination();
+    const audioContext = Tone.context.rawContext || Tone.context._context;
+    const dest = audioContext.createMediaStreamDestination();
 
-    // Clean up previous nodes
-    this.dynamicNodes.forEach((n) => { try { n.disconnect(); } catch (e) {} });
+    // Limpiar efectos anteriores
+    this.dynamicNodes.forEach((n) => {
+      try {
+        n.disconnect();
+        if (n.dispose) n.dispose();
+      } catch (e) {}
+    });
     this.dynamicNodes = [];
-    try { this.inputNode.disconnect(); } catch(e) {}
+    this.inputNode.disconnect();
 
-    const inp = this.inputNode;
-
+    // Crear y conectar nuevos efectos
     switch (effect) {
-      case "underwater": {
-        const lpf = ctx.createBiquadFilter();
-        lpf.type = "lowpass"; lpf.frequency.value = 500; lpf.Q.value = 1;
-        const rev = this._makeReverb(ctx, 2.8, 2, 0.5);
-        inp.connect(lpf);
-        rev.connect(lpf, dest);
-        this.dynamicNodes.push(lpf, rev.conv, rev.dryGain, rev.wetGain, rev.out);
-        break;
-      }
+      case "underwater":
+        this.filter.type = "lowpass";
+        this.filter.frequency.value = 500;
+        this.filter.Q.value = 1;
+        this.reverb.decay = 2.8;
+        this.reverb.wet.value = 0.5;
 
-      case "cave": {
-        const hpf = ctx.createBiquadFilter();
-        hpf.type = "highpass"; hpf.frequency.value = 120;
-        const delay = ctx.createDelay(1.0); delay.delayTime.value = 0.15;
-        const fbGain = ctx.createGain(); fbGain.gain.value = 0.35;
-        delay.connect(fbGain); fbGain.connect(delay); // feedback loop
-        const rev = this._makeReverb(ctx, 5, 1.5, 0.6);
-        inp.connect(hpf);
-        rev.connect(hpf, delay);
-        delay.connect(dest);
-        this.dynamicNodes.push(hpf, delay, fbGain, rev.conv, rev.dryGain, rev.wetGain, rev.out);
+        // CORRECTO: Todos son nodos de Tone.js
+        this.inputNode.chain(this.filter, this.reverb, dest);
         break;
-      }
 
-      case "mountain": {
-        const hpf = ctx.createBiquadFilter();
-        hpf.type = "highpass"; hpf.frequency.value = 100;
-        const delay = ctx.createDelay(1.0); delay.delayTime.value = 0.25;
-        const fbGain = ctx.createGain(); fbGain.gain.value = 0.25;
-        delay.connect(fbGain); fbGain.connect(delay);
-        const rev = this._makeReverb(ctx, 4, 1.5, 0.35);
-        inp.connect(hpf);
-        rev.connect(hpf, delay);
-        delay.connect(dest);
-        this.dynamicNodes.push(hpf, delay, fbGain, rev.conv, rev.dryGain, rev.wetGain, rev.out);
-        break;
-      }
+      case "cave":
+        const caveDelay = new Tone.FeedbackDelay("0.15", 0.35);
+        const caveReverb = new Tone.Reverb({ decay: 5, wet: 0.6 });
+        const caveEQ = new Tone.EQ3(-2, 0, -1);
+        this.dynamicNodes.push(caveDelay, caveReverb, caveEQ);
 
-      case "buried": {
-        const hpf = ctx.createBiquadFilter();
-        hpf.type = "highpass"; hpf.frequency.value = 150;
-        const lpf = ctx.createBiquadFilter();
-        lpf.type = "lowpass"; lpf.frequency.value = 300; lpf.Q.value = 2;
-        // LFO on cutoff
-        const lfo = ctx.createOscillator(); lfo.frequency.value = 0.3;
-        const lfoGain = ctx.createGain(); lfoGain.gain.value = 80;
-        lfo.connect(lfoGain); lfoGain.connect(lpf.frequency); lfo.start();
-        const attGain = ctx.createGain(); attGain.gain.value = 0.8;
-        const rev = this._makeReverb(ctx, 4, 1.2, 0.7);
-        inp.connect(hpf); hpf.connect(lpf);
-        rev.connect(lpf, attGain);
-        attGain.connect(dest);
-        this.dynamicNodes.push(hpf, lpf, lfo, lfoGain, attGain, rev.conv, rev.dryGain, rev.wetGain, rev.out);
-        break;
-      }
+        await caveReverb.ready;
 
-      default: {
-        // Clean path: HPF + LPF + Compressor (no Tone.Gate needed)
-        const hpf = ctx.createBiquadFilter();
-        hpf.type = "highpass"; hpf.frequency.value = 80;
-        const lpf = ctx.createBiquadFilter();
-        lpf.type = "lowpass"; lpf.frequency.value = 8000;
-        const comp = ctx.createDynamicsCompressor();
-        comp.threshold.value = -28; comp.ratio.value = 2.5;
-        comp.knee.value = 10; comp.attack.value = 0.003; comp.release.value = 0.1;
-        inp.connect(hpf); hpf.connect(lpf); lpf.connect(comp); comp.connect(dest);
-        this.dynamicNodes.push(hpf, lpf, comp);
+        // CORRECTO: Todos son nodos de Tone.js
+        this.inputNode.chain(caveEQ, caveReverb, caveDelay, dest);
         break;
-      }
+
+      case "mountain":
+        const mountainDelay = new Tone.FeedbackDelay("0.25", 0.25);
+        const mountainReverb = new Tone.Reverb({ decay: 4, wet: 0.35 });
+        const mountainEQ = new Tone.EQ3(-2, 0, -1);
+        this.dynamicNodes.push(mountainDelay, mountainReverb, mountainEQ);
+
+        await mountainReverb.ready;
+
+        this.inputNode.chain(mountainEQ, mountainReverb, mountainDelay, dest);
+        break;
+
+      case "buried":
+        const muffled = new Tone.Filter({
+          type: "lowpass",
+          frequency: 250,
+          Q: 2,
+        });
+        const secondFilter = new Tone.Filter({
+          type: "highpass",
+          frequency: 150,
+          Q: 1,
+        });
+
+        const lfo = new Tone.LFO("0.3Hz", 200, 400).start();
+        lfo.connect(muffled.frequency);
+
+        const buriedReverb = new Tone.Reverb({ decay: 4, wet: 0.7 });
+        const gainNode = new Tone.Gain(0.8);
+
+        this.dynamicNodes.push(
+          muffled,
+          secondFilter,
+          lfo,
+          buriedReverb,
+          gainNode
+        );
+
+        await buriedReverb.ready;
+
+        this.inputNode.chain(
+          secondFilter,
+          muffled,
+          buriedReverb,
+          gainNode,
+          dest
+        );
+        break;
+
+      default:
+        const noiseGate = new Tone.Gate(-45, 0.15);
+        const cleanFilter = new Tone.Filter({
+          type: "highpass",
+          frequency: 80,
+        });
+        const lowpassFilter = new Tone.Filter({
+          type: "lowpass",
+          frequency: 8000,
+        });
+        const compressor = new Tone.Compressor(-28, 2.5);
+
+        this.dynamicNodes.push(
+          noiseGate,
+          cleanFilter,
+          lowpassFilter,
+          compressor
+        );
+
+        this.inputNode.chain(
+          cleanFilter,
+          noiseGate,
+          lowpassFilter,
+          compressor,
+          dest
+        );
+        break;
     }
 
     this.processedStream = dest.stream;
@@ -540,14 +553,14 @@ class MicrophoneManager {
 
     try {
       this.mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
-      const audioContext = this.audioEffects._getAudioCtx();
+      const audioContext = Tone.context.rawContext || Tone.context._context;
 
       this.mediaStreamSource = audioContext.createMediaStreamSource(
         this.mediaStream
       );
       const inputNode = this.audioEffects.createInputNode(micVolume);
 
-      this.mediaStreamSource.connect(inputNode);
+      this.mediaStreamSource.connect(inputNode.input);
       await this.audioEffects.applyEffect("none", null);
       console.log("✓ Microphone started");
     } catch (error) {
@@ -637,14 +650,14 @@ class MicrophoneManager {
       };
 
       this.mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
-      const audioContext = this.audioEffects._getAudioCtx();
+      const audioContext = Tone.context.rawContext || Tone.context._context;
 
       this.mediaStreamSource = audioContext.createMediaStreamSource(
         this.mediaStream
       );
       const inputNode = this.audioEffects.createInputNode(1.0);
 
-      this.mediaStreamSource.connect(inputNode);
+      this.mediaStreamSource.connect(inputNode.input);
       await this.audioEffects.applyEffect("none", null);
 
       console.log("✓ Microphone changed successfully");
@@ -988,7 +1001,7 @@ class WebRTCManager {
       let remoteGain = null;
       let remoteSource = null;
       try {
-        const remoteAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const remoteAudioCtx = Tone.context.rawContext || Tone.context._context;
         if (remoteAudioCtx.state === "running") {
           remoteSource = remoteAudioCtx.createMediaStreamSource(remoteStream);
           remoteGain = remoteAudioCtx.createGain();
@@ -1671,39 +1684,38 @@ class UIManager {
   }
 
   updateParticipantsList(participants) {
-    const list = this.elements.participantsList;
-    const existingCards = list.querySelectorAll("[data-gtag]");
-    const currentTags = new Set(participants.map(p => p.gamertag));
-    existingCards.forEach(card => {
-      if (!currentTags.has(card.dataset.gtag)) card.remove();
-    });
+    this.elements.participantsList.innerHTML = "";
 
     participants.forEach((p) => {
       const info = p.getDisplayInfo();
-      const distanceText = info.isSelf ? "" : ` - ${info.distance}m`;
-      const volumeIcon = info.volume === 0 ? "🔇" : info.volume < 0.3 ? "🔉" : "🔊";
-      const safeTag = info.gamertag.replace(/"/g, "&quot;");
+      const div = document.createElement("div");
+      div.className = "participant";
 
-      let div = list.querySelector(`[data-gtag="${safeTag}"]`);
-      if (!div) {
-        div = document.createElement("div");
-        div.className = "participant";
-        div.dataset.gtag = info.gamertag;
-        div.innerHTML = `<img src="${info.skinUrl}" alt="${safeTag}" class="participant-skin"
-            onerror="this.style.display='none';this.nextElementSibling.style.display='inline';" />
-          <span class="participant-icon" style="display:none;">👤</span>
-          <span class="p-name"></span>
-          ${!info.isSelf ? `<span class="p-vol"></span>` : ""}`;
-        list.appendChild(div);
-      }
-      const nameEl = div.querySelector(".p-name");
-      const newName = `${info.gamertag}${info.isSelf ? " (You)" : ""}${distanceText}`;
-      if (nameEl && nameEl.textContent !== newName) nameEl.textContent = newName;
-      const volEl = div.querySelector(".p-vol");
-      if (volEl && volEl.textContent !== volumeIcon) volEl.textContent = volumeIcon;
+      const distanceText = info.isSelf ? "" : ` - ${info.distance}m`;
+      const volumeIcon =
+        info.volume === 0 ? "🔇" : info.volume < 0.3 ? "🔉" : "🔊";
+
+      div.innerHTML = `
+        <img 
+          src="${info.skinUrl}" 
+          alt="${info.gamertag}" 
+          class="participant-skin"
+          onerror="this.style.display='none'; this.nextElementSibling.style.display='inline';"
+        />
+        <span class="participant-icon" style="display:none;">👤</span>
+        <span class="participant-name">${info.gamertag}${
+        info.isSelf ? " (You)" : ""
+      }${distanceText}</span>
+        ${
+          !info.isSelf
+            ? `<span class="volume-indicator">${volumeIcon}</span>`
+            : ""
+        }
+      `;
+
+      this.elements.participantsList.appendChild(div);
     });
   }
-
 
   getGamertag() {
     return this.elements.gamertagInput.value.trim();
@@ -1929,10 +1941,8 @@ class VoiceChatApp {
     });
 
     this.ui.elements.connectBtn.addEventListener("click", async () => {
-      // Ensure AudioContext is running (required after user gesture)
-      const _ac = this.audioEffects._getAudioCtx();
-      if (_ac.state === "suspended") {
-        await _ac.resume();
+      if (Tone.context.state !== "running") {
+        await Tone.start();
         console.log("✓ AudioContext activated");
       }
       this.connectToRoom();
@@ -2351,6 +2361,12 @@ class VoiceChatApp {
         this.participantsManager.remove(data.gamertag);
         this.webrtc.closePeerConnection(data.gamertag);
 
+        // Reconectar a todos cuando alguien sale
+        console.log(
+          "⚡ Triggering full reconnection due to participant leaving"
+        );
+        await this.webrtc.reconnectAllPeers();
+
         this.updateUI();
       } else if (data.type === "offer" && data.to === this.currentGamertag) {
         console.log(`📨 Received offer from ${data.from}`);
@@ -2524,14 +2540,8 @@ class VoiceChatApp {
   }
 
   updateUI() {
-    // Debounce: coalesce rapid calls into a single rAF update
-    if (this._uiPending) return;
-    this._uiPending = true;
-    requestAnimationFrame(() => {
-      this._uiPending = false;
-      this.ui.updateGameStatus(this.minecraft.isInGame());
-      this.ui.updateParticipantsList(this.participantsManager.getAll());
-    });
+    this.ui.updateGameStatus(this.minecraft.isInGame());
+    this.ui.updateParticipantsList(this.participantsManager.getAll());
   }
 
   // Métodos de debug
@@ -2564,7 +2574,7 @@ class VoiceChatApp {
   testAudioOutput() {
     console.log("🔊 Generating test tone of 440Hz for 2 seconds...");
 
-    const audioContext = this.audioEffects._getAudioCtx();
+    const audioContext = Tone.context.rawContext || Tone.context._context;
     const oscillator = audioContext.createOscillator();
     const gainNode = audioContext.createGain();
 
