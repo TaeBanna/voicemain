@@ -727,8 +727,13 @@ class Participant {
     if (this.gainNode) {
       // Native WebAudio GainNode supports values > 1.0 (above 100%)
       this.gainNode.gain.value = finalVolume * outputGain;
+      // Keep audio element muted when Web Audio is handling output
+      if (this.audioElement) {
+        this.audioElement.volume = 0;
+      }
     } else if (this.audioElement) {
-      this.audioElement.volume = Math.min(1, finalVolume * outputGain);
+      // iOS/Android fallback: use audio element volume directly
+      this.audioElement.volume = Math.min(1, Math.max(0, finalVolume * outputGain));
     }
   }
 
@@ -951,27 +956,88 @@ class WebRTCManager {
       console.log(`🎵 ${remoteGamertag} connected`);
 
       const remoteStream = event.streams[0];
+      if (!remoteStream) {
+        console.warn(`⚠️ No stream in ontrack event for ${remoteGamertag}`);
+        return;
+      }
 
-      // Use a native WebAudio GainNode so output volume can exceed 100%
-      const remoteAudioCtx = Tone.context.rawContext || Tone.context._context;
-      const remoteSource = remoteAudioCtx.createMediaStreamSource(remoteStream);
-      const remoteGain = remoteAudioCtx.createGain();
-      remoteGain.gain.value = 1.0;
-      remoteSource.connect(remoteGain);
-      remoteGain.connect(remoteAudioCtx.destination);
+      // Remove old audio element if it exists (e.g. after reconnect)
+      const oldEl = document.getElementById(`audio-${remoteGamertag}`);
+      if (oldEl) {
+        oldEl.pause();
+        oldEl.srcObject = null;
+        oldEl.remove();
+      }
 
-      // Silent <audio> to keep stream alive and satisfy autoplay policy
+      // PRIMARY: <audio> element handles playback on all platforms (iOS, Android, Desktop)
       const audioElement = document.createElement("audio");
       audioElement.srcObject = remoteStream;
       audioElement.autoplay = true;
-      audioElement.volume = 0;
+      audioElement.playsInline = true; // Critical for iOS Safari
+      audioElement.volume = 1.0;       // Full volume - controlled via gainNode or element.volume
       audioElement.id = `audio-${remoteGamertag}`;
       audioElement.style.display = "none";
       document.body.appendChild(audioElement);
-      audioElement.play().catch(() => {
-        const resume = () => { audioElement.play().catch(() => {}); document.removeEventListener("click", resume); };
-        document.addEventListener("click", resume);
-      });
+
+      const playAudio = () => {
+        const playPromise = audioElement.play();
+        if (playPromise !== undefined) {
+          playPromise.catch((err) => {
+            console.warn(`⚠️ Autoplay blocked for ${remoteGamertag}:`, err);
+            // Retry on next user gesture
+            const resume = () => {
+              audioElement.play().catch(() => {});
+              document.removeEventListener("click", resume);
+              document.removeEventListener("touchend", resume);
+            };
+            document.addEventListener("click", resume);
+            document.addEventListener("touchend", resume);
+          });
+        }
+      };
+      playAudio();
+
+      // SECONDARY: Try Web Audio GainNode for volume control (may not work on iOS if context suspended)
+      let remoteGain = null;
+      let remoteSource = null;
+      try {
+        const remoteAudioCtx = Tone.context.rawContext || Tone.context._context;
+        if (remoteAudioCtx.state === "running") {
+          remoteSource = remoteAudioCtx.createMediaStreamSource(remoteStream);
+          remoteGain = remoteAudioCtx.createGain();
+          remoteGain.gain.value = 1.0;
+          remoteSource.connect(remoteGain);
+          remoteGain.connect(remoteAudioCtx.destination);
+          // When using Web Audio routing, mute the element to avoid double audio
+          audioElement.volume = 0;
+          console.log(`✓ Web Audio routing active for ${remoteGamertag}`);
+        } else {
+          console.log(`ℹ️ AudioContext not running (${remoteAudioCtx.state}) for ${remoteGamertag} — using <audio> element directly`);
+        }
+
+        // If AudioContext resumes later, try to switch to Web Audio routing
+        remoteAudioCtx.onstatechange = () => {
+          if (remoteAudioCtx.state === "running" && !remoteGain) {
+            try {
+              remoteSource = remoteAudioCtx.createMediaStreamSource(remoteStream);
+              remoteGain = remoteAudioCtx.createGain();
+              remoteGain.gain.value = 1.0;
+              remoteSource.connect(remoteGain);
+              remoteGain.connect(remoteAudioCtx.destination);
+              audioElement.volume = 0;
+              const p = this.participantsManager.get(remoteGamertag);
+              if (p) {
+                p.setAudioNodes(remoteGain, audioElement, remoteSource);
+              }
+              console.log(`✓ Web Audio routing upgraded for ${remoteGamertag}`);
+            } catch (e) {
+              console.warn(`⚠️ Could not upgrade to Web Audio for ${remoteGamertag}:`, e);
+            }
+          }
+        };
+      } catch (e) {
+        console.warn(`⚠️ Web Audio setup failed for ${remoteGamertag}, using <audio> fallback:`, e);
+      }
 
       const participant = this.participantsManager.get(remoteGamertag);
       if (participant) {
@@ -2306,13 +2372,47 @@ class VoiceChatApp {
         console.log(`📨 Received offer from ${data.from}`);
         this.participantsManager.add(data.from, false);
 
-        const pc = await this.webrtc.createPeerConnection(data.from);
+        let pc = this.webrtc.getPeerConnection(data.from);
 
-        if (
-          pc.signalingState === "stable" ||
-          pc.signalingState === "have-local-offer"
-        ) {
+        // Handle offer collision (glare): if we have a local offer too, the peer
+        // with the lexicographically lower gamertag yields (rollback and accept remote)
+        if (pc && pc.signalingState === "have-local-offer") {
+          const weYield = this.currentGamertag.toLowerCase() > data.from.toLowerCase();
+          if (weYield) {
+            console.log(`🔄 Offer collision with ${data.from} — we yield, rolling back`);
+            try {
+              await pc.setLocalDescription({ type: "rollback" });
+            } catch (e) {
+              // Rollback not supported (older browsers) — recreate connection
+              console.warn(`⚠️ Rollback not supported, recreating connection with ${data.from}`);
+              this.webrtc.closePeerConnection(data.from);
+              pc = null;
+            }
+          } else {
+            // We win — ignore their offer, they will yield
+            console.log(`🏆 Offer collision with ${data.from} — we win, ignoring their offer`);
+            return;
+          }
+        }
+
+        if (!pc) {
+          pc = await this.webrtc.createPeerConnection(data.from);
+        }
+
+        if (pc.signalingState === "stable" || pc.signalingState === "have-remote-offer") {
           await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+
+          // Flush any queued ICE candidates
+          if (pc._pendingCandidates && pc._pendingCandidates.length > 0) {
+            console.log(`🧊 Flushing ${pc._pendingCandidates.length} queued ICE candidates for ${data.from}`);
+            for (const candidate of pc._pendingCandidates) {
+              await pc.addIceCandidate(new RTCIceCandidate(candidate)).catch((e) => {
+                console.warn(`⚠️ Failed to add queued ICE candidate:`, e);
+              });
+            }
+            pc._pendingCandidates = [];
+          }
+
           const answer = await pc.createAnswer();
           await pc.setLocalDescription(answer);
 
@@ -2325,6 +2425,8 @@ class VoiceChatApp {
             })
           );
           console.log(`📤 Sent answer to ${data.from}`);
+        } else {
+          console.warn(`⚠️ Cannot handle offer from ${data.from} in state: ${pc.signalingState}`);
         }
         this.updateUI();
       } else if (data.type === "answer" && data.to === this.currentGamertag) {
@@ -2334,6 +2436,17 @@ class VoiceChatApp {
         if (pc && pc.signalingState === "have-local-offer") {
           await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
           console.log(`✓ Answer applied for ${data.from}`);
+
+          // Flush any queued ICE candidates
+          if (pc._pendingCandidates && pc._pendingCandidates.length > 0) {
+            console.log(`🧊 Flushing ${pc._pendingCandidates.length} queued ICE candidates for ${data.from}`);
+            for (const candidate of pc._pendingCandidates) {
+              await pc.addIceCandidate(new RTCIceCandidate(candidate)).catch((e) => {
+                console.warn(`⚠️ Failed to add queued ICE candidate:`, e);
+              });
+            }
+            pc._pendingCandidates = [];
+          }
         }
       } else if (
         data.type === "ice-candidate" &&
@@ -2341,15 +2454,43 @@ class VoiceChatApp {
       ) {
         const pc = this.webrtc.getPeerConnection(data.from);
         if (pc && data.candidate) {
-          await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+          if (pc.remoteDescription && pc.remoteDescription.type) {
+            await pc.addIceCandidate(new RTCIceCandidate(data.candidate)).catch((e) => {
+              console.warn(`⚠️ Failed to add ICE candidate from ${data.from}:`, e);
+            });
+          } else {
+            // Queue candidate until remote description is set
+            if (!pc._pendingCandidates) pc._pendingCandidates = [];
+            pc._pendingCandidates.push(data.candidate);
+            console.log(`⏳ Queued ICE candidate from ${data.from} (remote desc not set yet)`);
+          }
         }
       } else if (data.type === "participants-list") {
         console.log(`📋 Received participants list: ${data.list.join(", ")}`);
-        data.list.forEach((gt) => {
+        for (const gt of data.list) {
           if (gt !== this.currentGamertag) {
             this.participantsManager.add(gt, false);
+            // Connect to each existing participant if not already connected
+            if (!this.webrtc.getPeerConnection(gt)) {
+              console.log(`🔗 Connecting to existing participant: ${gt}`);
+              try {
+                const pc = await this.webrtc.createPeerConnection(gt);
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+                this.ws.send(
+                  JSON.stringify({
+                    type: "offer",
+                    offer: offer,
+                    from: this.currentGamertag,
+                    to: gt,
+                  })
+                );
+              } catch (e) {
+                console.error(`❌ Failed to connect to ${gt}:`, e);
+              }
+            }
           }
-        });
+        }
         this.updateUI();
       }
     } catch (e) {
