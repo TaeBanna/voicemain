@@ -1487,6 +1487,8 @@ class UIManager {
       pttKeyDisplay: document.getElementById("pttKeyDisplay"),
       // NUEVO: Selector de micrófono
       micSelector: document.getElementById("micSelector"),
+      // Mic toggle button
+      micToggleBtn: document.getElementById("micToggleBtn"),
     };
 
     this.elements.minecraftConnectContainer.id = "minecraftConnectContainer";
@@ -1883,7 +1885,28 @@ class VoiceChatApp {
     });
 
     this.ui.elements.exitBtn.addEventListener("click", () => this.exitCall());
-  }
+
+    // Mic toggle button
+    if (this.ui.elements.micToggleBtn) {
+      this.ui.elements.micToggleBtn.addEventListener("click", () => {
+        const isMuted = this.micManager.toggleMute();
+        const btn = this.ui.elements.micToggleBtn;
+        const icon = btn.querySelector(".icon");
+        const label = btn.querySelector("span:not(.icon)");
+
+        if (isMuted) {
+          btn.classList.add("muted");
+          if (icon) icon.textContent = "🔇";
+          if (label) label.textContent = "Mic Off";
+        } else {
+          btn.classList.remove("muted");
+          if (icon) icon.textContent = "🎤";
+          if (label) label.textContent = "Mic On";
+        }
+
+        console.log(`🎤 Mic toggled: ${isMuted ? "MUTED" : "UNMUTED"}`);
+      });
+    }
 
   // NUEVO: Configurar Push-to-Talk
   setupPushToTalk() {
