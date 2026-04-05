@@ -1,10 +1,7 @@
 // =====================================================
-// EnviroVoice - script.js (Rebuilt)
+// CLASE: VOICE DETECTOR
 // =====================================================
 
-// =====================================================
-// CLASS: VoiceDetector
-// =====================================================
 class VoiceDetector {
   constructor(stream, onVoiceChange) {
     this.stream = stream;
@@ -15,176 +12,286 @@ class VoiceDetector {
     this.dataArray = null;
     this.isTalking = false;
     this.detectionInterval = null;
-    this.threshold = -30;
-    this.silenceThreshold = -42;
+
+    // Configuración de umbrales
+    this.threshold = -25;
+    this.silenceThreshold = -30;
     this.silenceDelay = 500;
     this.lastSpeakTime = 0;
+
     this.init();
   }
 
   async init() {
     try {
-      this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      this.audioContext = new (window.AudioContext ||
+        window.webkitAudioContext)();
       this.analyser = this.audioContext.createAnalyser();
       this.analyser.fftSize = 2048;
       this.analyser.smoothingTimeConstant = 0.8;
+
       this.microphone = this.audioContext.createMediaStreamSource(this.stream);
       this.microphone.connect(this.analyser);
+
       this.dataArray = new Uint8Array(this.analyser.frequencyBinCount);
+
       this.startDetection();
+      console.log("✓ Voice detector initialized");
     } catch (error) {
-      console.error('VoiceDetector init error:', error);
+      console.error("❌ Voice detector init error:", error);
     }
   }
 
   getVolumeDb() {
     this.analyser.getByteTimeDomainData(this.dataArray);
+
     let sum = 0;
     for (let i = 0; i < this.dataArray.length; i++) {
-      const v = this.dataArray[i] - 128;
+      const v = this.dataArray[i] - 128; // centrar
       sum += v * v;
     }
+
     const rms = Math.sqrt(sum / this.dataArray.length);
-    return 20 * Math.log10(rms / 128);
+    const db = 20 * Math.log10(rms / 128);
+
+    return db;
   }
 
   startDetection() {
     this.detectionInterval = setInterval(() => {
       const volumeDb = this.getVolumeDb();
       const now = Date.now();
+
       if (volumeDb > this.threshold) {
         this.lastSpeakTime = now;
-        if (!this.isTalking) { this.isTalking = true; }
+
+        if (!this.isTalking) {
+          this.isTalking = true;
+          this.notifyChange(true, volumeDb);
+        }
       } else if (volumeDb < this.silenceThreshold && this.isTalking) {
-        if (now - this.lastSpeakTime > this.silenceDelay) { this.isTalking = false; }
+        if (now - this.lastSpeakTime > this.silenceDelay) {
+          this.isTalking = false;
+          this.notifyChange(false, volumeDb);
+        }
       }
-      if (this.onVoiceChange) this.onVoiceChange(this.isTalking, volumeDb);
-    }, 100);
+      this.notifyChange(this.isTalking, volumeDb);
+    });
+  }
+
+  notifyChange(isTalking, volumeDb) {
+    if (this.onVoiceChange) {
+      this.onVoiceChange(isTalking, volumeDb);
+    }
   }
 
   setSensitivity(level) {
-    const map = {
-      low:    { t: -40, s: -48 },
-      medium: { t: -34, s: -44 },
-      high:   { t: -30, s: -42 },
-    };
-    if (map[level]) {
-      this.threshold = map[level].t;
-      this.silenceThreshold = map[level].s;
+    switch (level) {
+      case "low": // hablar normal sin gritar
+        this.threshold = -40; // habla desde voz baja
+        this.silenceThreshold = -48; // silencio real
+        break;
+
+      case "medium": // buena para la mayoría
+        this.threshold = -34; // voz normal detectada rápido
+        this.silenceThreshold = -44;
+        break;
+
+      case "high": // si quieres detectar susurros
+        this.threshold = -30; // casi cualquier voz activa
+        this.silenceThreshold = -42;
+        break;
+
+      default:
+        throw new Error(`Unknown sensitivity level: ${level}`);
     }
   }
 
   dispose() {
-    if (this.detectionInterval) clearInterval(this.detectionInterval);
-    if (this.microphone) this.microphone.disconnect();
-    if (this.audioContext && this.audioContext.state !== 'closed') this.audioContext.close();
+    if (this.detectionInterval) {
+      clearInterval(this.detectionInterval);
+    }
+
+    if (this.microphone) {
+      this.microphone.disconnect();
+    }
+
+    if (this.audioContext && this.audioContext.state !== "closed") {
+      this.audioContext.close();
+    }
+
+    console.log("✓ Voice detector disposed");
   }
 }
 
 // =====================================================
-// CLASS: AudioEffectsManager
+// CLASE: AudioEffectsManager
+// Maneja efectos de audio (reverb, cave, underwater, etc.)
 // =====================================================
 class AudioEffectsManager {
   constructor() {
     this.reverb = null;
     this.filter = null;
+    this.chorus = null;
     this.dynamicNodes = [];
-    this.currentEffect = 'none';
-    this.inputNode = null;
+    this.currentEffect = "none";
+    this.inputNode = null; // Ahora será Tone.Gain
     this.processedStream = null;
-    this.lastEffectChange = 0;
+    this.lastEffectChange = 0; // NUEVO: Para throttling
   }
 
   async init() {
     this.reverb = new Tone.Reverb({ decay: 2.5, wet: 0.35 });
-    this.filter = new Tone.Filter({ type: 'lowpass', frequency: 1200 });
+    this.filter = new Tone.Filter({ type: "lowpass", frequency: 1200 });
+    this.chorus = new Tone.Chorus({
+      frequency: 1.5,
+      delayTime: 3.5,
+      depth: 0.7,
+      wet: 0.25,
+    });
     await this.reverb.generate();
+    console.log("✓ Audio effects initialized");
   }
 
   createInputNode(micVolume = 1.0) {
+    // CRÍTICO: Usar Tone.Gain en lugar de nodo nativo
     this.inputNode = new Tone.Gain(micVolume);
     return this.inputNode;
   }
 
-  connectSourceStream(mediaStream) {
-    // Connect a raw MediaStream into the Tone.js graph correctly
-    const audioContext = Tone.context.rawContext || Tone.context._context;
-    const source = audioContext.createMediaStreamSource(mediaStream);
-    // Tone.Gain exposes its underlying AudioNode via .input
-    const toneInput = this.inputNode.input;
-    source.connect(toneInput);
-  }
-
   async applyEffect(effect, peerConnections) {
-    if (!this.inputNode) return;
+    if (!this.inputNode) {
+      console.error("❌ No input node available");
+      return;
+    }
+
+    // CRÍTICO: Throttle para evitar cambios muy frecuentes
     const now = Date.now();
-    if (this.currentEffect === effect && this.processedStream !== null) return;
-    if (this.processedStream !== null && now - this.lastEffectChange < 1000) return;
+    if (this.currentEffect === effect && this.processedStream !== null) {
+      return;
+    }
+
+    // Limitar a 1 cambio por segundo
+    if (this.processedStream !== null && now - this.lastEffectChange < 1000) {
+      return;
+    }
     this.lastEffectChange = now;
+
+    console.log(`🎨 Changing effect: ${this.currentEffect} → ${effect}`);
 
     const audioContext = Tone.context.rawContext || Tone.context._context;
     const dest = audioContext.createMediaStreamDestination();
-    // Wrap native dest so Tone.js can chain into it
-    const toneDestNode = Tone.context.createGain();
-    toneDestNode.connect(dest);
-    const toneDest = { input: toneDestNode };
 
-    this.dynamicNodes.forEach(n => { try { n.disconnect(); if (n.dispose) n.dispose(); } catch(e){} });
+    // Limpiar efectos anteriores
+    this.dynamicNodes.forEach((n) => {
+      try {
+        n.disconnect();
+        if (n.dispose) n.dispose();
+      } catch (e) {}
+    });
     this.dynamicNodes = [];
-    try { this.inputNode.disconnect(); } catch(e) {}
+    this.inputNode.disconnect();
 
+    // Crear y conectar nuevos efectos
     switch (effect) {
-      case 'underwater':
-        this.filter.type = 'lowpass';
+      case "underwater":
+        this.filter.type = "lowpass";
         this.filter.frequency.value = 500;
+        this.filter.Q.value = 1;
+        this.reverb.decay = 2.8;
         this.reverb.wet.value = 0.5;
-        this.inputNode.connect(this.filter);
-        this.filter.connect(this.reverb);
-        this.reverb.connect(toneDest.input);
+
+        // CORRECTO: Todos son nodos de Tone.js
+        this.inputNode.chain(this.filter, this.reverb, dest);
         break;
-      case 'cave': {
-        const caveDelay = new Tone.FeedbackDelay('0.15', 0.35);
+
+      case "cave":
+        const caveDelay = new Tone.FeedbackDelay("0.15", 0.35);
         const caveReverb = new Tone.Reverb({ decay: 5, wet: 0.6 });
-        await caveReverb.generate();
-        this.dynamicNodes.push(caveDelay, caveReverb);
-        this.inputNode.connect(caveReverb);
-        caveReverb.connect(caveDelay);
-        caveDelay.connect(toneDest.input);
+        const caveEQ = new Tone.EQ3(-2, 0, -1);
+        this.dynamicNodes.push(caveDelay, caveReverb, caveEQ);
+
+        await caveReverb.ready;
+
+        // CORRECTO: Todos son nodos de Tone.js
+        this.inputNode.chain(caveEQ, caveReverb, caveDelay, dest);
         break;
-      }
-      case 'mountain': {
-        const mtnDelay = new Tone.FeedbackDelay('0.25', 0.25);
-        const mtnReverb = new Tone.Reverb({ decay: 4, wet: 0.35 });
-        await mtnReverb.generate();
-        this.dynamicNodes.push(mtnDelay, mtnReverb);
-        this.inputNode.connect(mtnReverb);
-        mtnReverb.connect(mtnDelay);
-        mtnDelay.connect(toneDest.input);
+
+      case "mountain":
+        const mountainDelay = new Tone.FeedbackDelay("0.25", 0.25);
+        const mountainReverb = new Tone.Reverb({ decay: 4, wet: 0.35 });
+        const mountainEQ = new Tone.EQ3(-2, 0, -1);
+        this.dynamicNodes.push(mountainDelay, mountainReverb, mountainEQ);
+
+        await mountainReverb.ready;
+
+        this.inputNode.chain(mountainEQ, mountainReverb, mountainDelay, dest);
         break;
-      }
-      case 'buried': {
-        const muffled = new Tone.Filter({ type: 'lowpass', frequency: 250, Q: 2 });
+
+      case "buried":
+        const muffled = new Tone.Filter({
+          type: "lowpass",
+          frequency: 250,
+          Q: 2,
+        });
+        const secondFilter = new Tone.Filter({
+          type: "highpass",
+          frequency: 150,
+          Q: 1,
+        });
+
+        const lfo = new Tone.LFO("0.3Hz", 200, 400).start();
+        lfo.connect(muffled.frequency);
+
         const buriedReverb = new Tone.Reverb({ decay: 4, wet: 0.7 });
-        await buriedReverb.generate();
-        this.dynamicNodes.push(muffled, buriedReverb);
-        this.inputNode.connect(muffled);
-        muffled.connect(buriedReverb);
-        buriedReverb.connect(toneDest.input);
+        const gainNode = new Tone.Gain(0.8);
+
+        this.dynamicNodes.push(
+          muffled,
+          secondFilter,
+          lfo,
+          buriedReverb,
+          gainNode
+        );
+
+        await buriedReverb.ready;
+
+        this.inputNode.chain(
+          secondFilter,
+          muffled,
+          buriedReverb,
+          gainNode,
+          dest
+        );
         break;
-      }
-      default: {
-        const gate = new Tone.Gate(-45, 0.15);
-        const hp = new Tone.Filter({ type: 'highpass', frequency: 80 });
-        const lp = new Tone.Filter({ type: 'lowpass', frequency: 8000 });
-        const comp = new Tone.Compressor(-28, 2.5);
-        this.dynamicNodes.push(gate, hp, lp, comp);
-        this.inputNode.connect(hp);
-        hp.connect(gate);
-        gate.connect(lp);
-        lp.connect(comp);
-        comp.connect(toneDest.input);
+
+      default:
+        const noiseGate = new Tone.Gate(-45, 0.15);
+        const cleanFilter = new Tone.Filter({
+          type: "highpass",
+          frequency: 80,
+        });
+        const lowpassFilter = new Tone.Filter({
+          type: "lowpass",
+          frequency: 8000,
+        });
+        const compressor = new Tone.Compressor(-28, 2.5);
+
+        this.dynamicNodes.push(
+          noiseGate,
+          cleanFilter,
+          lowpassFilter,
+          compressor
+        );
+
+        this.inputNode.chain(
+          cleanFilter,
+          noiseGate,
+          lowpassFilter,
+          compressor,
+          dest
+        );
         break;
-      }
     }
 
     this.processedStream = dest.stream;
@@ -192,176 +299,394 @@ class AudioEffectsManager {
 
     if (this.processedStream && peerConnections && peerConnections.size > 0) {
       const newTrack = this.processedStream.getAudioTracks()[0];
-      if (!newTrack) return;
-      const promises = [];
-      peerConnections.forEach((pc, gt) => {
-        const sender = pc.getSenders().find(s => s.track && s.track.kind === 'audio');
-        if (sender) promises.push(sender.replaceTrack(newTrack));
-      });
-      await Promise.all(promises);
-    }
-  }
 
-  updateVolume(volume) {
-    if (this.inputNode) this.inputNode.gain.value = volume;
-  }
-
-  getProcessedStream() { return this.processedStream; }
-  getCurrentEffect() { return this.currentEffect; }
-}
-
-// =====================================================
-// CLASS: MicrophoneManager
-// =====================================================
-class MicrophoneManager {
-  constructor(audioEffects) {
-    this.mediaStream = null;
-    this.audioEffects = audioEffects;
-    this.isMuted = false;
-    this.currentDeviceId = null;
-  }
-
-  async start(deviceId = null, micVolume = 1.0) {
-    if (!navigator.mediaDevices?.getUserMedia) {
-      throw new Error('Browser does not support audio capture. Please use HTTPS or a modern browser.');
-    }
-    const constraints = {
-      audio: {
-        deviceId: deviceId ? { exact: deviceId } : undefined,
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
+      if (!newTrack) {
+        console.error("❌ No audio track found in processedStream");
+        return;
       }
-    };
-    this.mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
-    this.currentDeviceId = deviceId;
 
-    this.audioEffects.createInputNode(micVolume);
-    // Use the dedicated method that correctly connects Web Audio API source into Tone.js
-    this.audioEffects.connectSourceStream(this.mediaStream);
-    await this.audioEffects.applyEffect('none', null);
-  }
+      const updatePromises = [];
 
-  async changeMicrophone(deviceId) {
-    this.stop();
-    await this.start(deviceId, this.audioEffects.inputNode?.gain.value || 1.0);
-  }
+      peerConnections.forEach((peerData, gamertag) => {
+        const pc = peerData.pc || peerData;
+        const senders = pc.getSenders();
+        const audioSender = senders.find(
+          (s) => s.track && s.track.kind === "audio"
+        );
 
-  toggleMute() {
-    this.isMuted = !this.isMuted;
-    if (this.mediaStream) {
-      this.mediaStream.getAudioTracks().forEach(t => t.enabled = !this.isMuted);
-    }
-    return this.isMuted;
-  }
+        if (audioSender) {
+          const promise = audioSender
+            .replaceTrack(newTrack)
+            .then(() => {
+              console.log(`✓ Track replaced for ${gamertag} (${effect})`);
+            })
+            .catch((e) => {
+              console.error(`❌ Error replacing track for ${gamertag}:`, e);
+            });
+          updatePromises.push(promise);
+        }
+      });
 
-  setEnabled(enabled) {
-    if (this.mediaStream) {
-      this.mediaStream.getAudioTracks().forEach(t => t.enabled = enabled);
-    }
-  }
-
-  stop() {
-    if (this.mediaStream) {
-      this.mediaStream.getTracks().forEach(t => t.stop());
-      this.mediaStream = null;
+      await Promise.all(updatePromises);
+      console.log(`✅ Effect applied to ${updatePromises.length} peer(s)`);
     }
   }
 
-  getStream() { return this.mediaStream; }
-  isMicMuted() { return this.isMuted; }
+  updateVolume(volume, peerConnections = null) {
+    if (this.inputNode) {
+      const oldVolume = this.inputNode.gain.value;
+      const changed = Math.abs(oldVolume - volume) > 0.05;
 
-  static async getAudioInputDevices() {
-    try {
-      const temp = await navigator.mediaDevices.getUserMedia({ audio: true });
-      temp.getTracks().forEach(t => t.stop());
-    } catch(e) {}
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    return devices.filter(d => d.kind === 'audioinput');
+      this.inputNode.gain.value = volume;
+
+      if (changed) {
+        console.log(
+          `🎚️ Volume: ${(oldVolume * 100).toFixed(0)}% → ${(
+            volume * 100
+          ).toFixed(0)}%`
+        );
+      }
+    }
   }
 
-  static async getAudioOutputDevices() {
-    try {
-      const temp = await navigator.mediaDevices.getUserMedia({ audio: true });
-      temp.getTracks().forEach(t => t.stop());
-    } catch(e) {}
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    return devices.filter(d => d.kind === 'audiooutput');
+  getProcessedStream() {
+    return this.processedStream;
+  }
+
+  getCurrentEffect() {
+    return this.currentEffect;
   }
 }
 
 // =====================================================
-// CLASS: PushToTalkManager
+// CLASE: PushToTalkManager
+// Maneja el sistema de Push-to-Talk
 // =====================================================
 class PushToTalkManager {
   constructor(micManager, webrtcManager) {
     this.micManager = micManager;
     this.webrtcManager = webrtcManager;
     this.enabled = false;
-    this.key = 'KeyV';
-    this.keyDisplay = 'V';
+    this.key = "KeyV";
+    this.keyDisplay = "V";
     this.isKeyPressed = false;
     this.isTalking = false;
     this.onTalkingChange = null;
   }
 
+  setWebRTCManager(webrtcManager) {
+    this.webrtcManager = webrtcManager;
+  }
+
   setEnabled(enabled) {
     this.enabled = enabled;
+
     if (enabled) {
+      // Cuando se activa PTT, mutear completamente
       this.isTalking = false;
       this.isKeyPressed = false;
-      this._muteAll();
+      this.muteAllSenders();
+      this.notifyTalkingChange();
+      console.log(
+        `🎙️ Push-to-Talk enabled (Key: ${this.keyDisplay}) - Microphone MUTED by default`
+      );
     } else {
+      // Al desactivar PTT, activar el micrófono
       this.isTalking = true;
-      this._unmuteAll();
+      this.unmuteAllSenders();
+      this.notifyTalkingChange();
+      console.log("🎙️ Push-to-Talk disabled - Microphone ACTIVE");
     }
-    this._notify();
   }
 
-  _muteAll() {
-    this.webrtcManager?.peerConnections?.forEach(pc => {
-      pc.getSenders().forEach(s => { if (s.track?.kind === 'audio') s.track.enabled = false; });
+  // NUEVO: Mutear todos los senders de WebRTC
+  muteAllSenders() {
+    if (!this.webrtcManager || !this.webrtcManager.peerConnections) {
+      console.log("⚠️ No WebRTC connections available to mute");
+      return;
+    }
+
+    let mutedCount = 0;
+    this.webrtcManager.peerConnections.forEach((pc, gamertag) => {
+      // pc es directamente el RTCPeerConnection, no un objeto wrapper
+      const senders = pc.getSenders();
+      senders.forEach((sender) => {
+        if (sender.track && sender.track.kind === "audio") {
+          sender.track.enabled = false;
+          mutedCount++;
+        }
+      });
     });
+
+    console.log(
+      `🔇 Muted ${mutedCount} audio sender(s) across ${this.webrtcManager.peerConnections.size} peer(s)`
+    );
   }
 
-  _unmuteAll() {
-    this.webrtcManager?.peerConnections?.forEach(pc => {
-      pc.getSenders().forEach(s => { if (s.track?.kind === 'audio') s.track.enabled = true; });
+  // NUEVO: Desmutear todos los senders de WebRTC
+  unmuteAllSenders() {
+    if (!this.webrtcManager || !this.webrtcManager.peerConnections) {
+      console.log("⚠️ No WebRTC connections available to unmute");
+      return;
+    }
+
+    let unmutedCount = 0;
+    this.webrtcManager.peerConnections.forEach((pc, gamertag) => {
+      // pc es directamente el RTCPeerConnection, no un objeto wrapper
+      const senders = pc.getSenders();
+      senders.forEach((sender) => {
+        if (sender.track && sender.track.kind === "audio") {
+          sender.track.enabled = true;
+          unmutedCount++;
+        }
+      });
     });
+
+    console.log(
+      `🔊 Unmuted ${unmutedCount} audio sender(s) across ${this.webrtcManager.peerConnections.size} peer(s)`
+    );
   }
 
   setKey(key, display) {
     this.key = key;
     this.keyDisplay = display;
+    console.log(`🔑 PTT key changed to: ${display}`);
   }
 
-  handleKeyDown(e) {
-    if (!this.enabled || e.code !== this.key || this.isKeyPressed) return;
-    this.isKeyPressed = true;
-    this.isTalking = true;
-    this._unmuteAll();
-    this._notify();
+  handleKeyDown(event) {
+    if (!this.enabled) return;
+
+    if (event.code === this.key && !this.isKeyPressed) {
+      this.isKeyPressed = true;
+      this.isTalking = true;
+
+      // CRÍTICO: Activar todos los senders de WebRTC
+      this.unmuteAllSenders();
+
+      this.notifyTalkingChange();
+      this.showTalkingIndicator();
+      console.log("🎤 PTT: Talking...");
+    }
   }
 
-  handleKeyUp(e) {
-    if (!this.enabled || e.code !== this.key || !this.isKeyPressed) return;
-    this.isKeyPressed = false;
-    this.isTalking = false;
-    this._muteAll();
-    this._notify();
+  handleKeyUp(event) {
+    if (!this.enabled) return;
+
+    if (event.code === this.key && this.isKeyPressed) {
+      this.isKeyPressed = false;
+      this.isTalking = false;
+
+      // CRÍTICO: Mutear todos los senders de WebRTC
+      this.muteAllSenders();
+
+      this.notifyTalkingChange();
+      this.hideTalkingIndicator();
+      console.log("🔇 PTT: Stopped talking");
+    }
   }
 
-  _notify() {
-    if (this.onTalkingChange) this.onTalkingChange(this.isTalking);
+  showTalkingIndicator() {
+    let indicator = document.getElementById("pttActiveIndicator");
+    if (!indicator) {
+      indicator = document.createElement("div");
+      indicator.id = "pttActiveIndicator";
+      indicator.className = "ptt-active-indicator";
+      indicator.textContent = `🎤 Talking (${this.keyDisplay})`;
+      document.body.appendChild(indicator);
+    }
   }
 
-  setOnTalkingChange(cb) { this.onTalkingChange = cb; }
-  isEnabled() { return this.enabled; }
-  isSpeaking() { return this.isTalking; }
+  hideTalkingIndicator() {
+    const indicator = document.getElementById("pttActiveIndicator");
+    if (indicator) {
+      indicator.remove();
+    }
+  }
+
+  setOnTalkingChange(callback) {
+    this.onTalkingChange = callback;
+  }
+
+  notifyTalkingChange() {
+    if (this.onTalkingChange) {
+      this.onTalkingChange(this.isTalking);
+    }
+  }
+
+  isSpeaking() {
+    return this.isTalking;
+  }
+
+  isEnabled() {
+    return this.enabled;
+  }
 }
 
 // =====================================================
-// CLASS: Participant
+// CLASE: MicrophoneManager
+// Maneja el micrófono del usuario
+// =====================================================
+class MicrophoneManager {
+  constructor(audioEffects) {
+    this.mediaStream = null;
+    this.mediaStreamSource = null;
+    this.audioEffects = audioEffects;
+    this.isMuted = false;
+  }
+
+  async start(micVolume = 1.0) {
+    // NUEVO: Validar que getUserMedia esté disponible
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error(
+        "Your browser doesn't support audio capture. " +
+          "Please use HTTPS or try a different browser (Chrome, Firefox, Safari)."
+      );
+    }
+
+    const constraints = {
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    };
+
+    try {
+      this.mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+      const audioContext = Tone.context.rawContext || Tone.context._context;
+
+      this.mediaStreamSource = audioContext.createMediaStreamSource(
+        this.mediaStream
+      );
+      const inputNode = this.audioEffects.createInputNode(micVolume);
+
+      this.mediaStreamSource.connect(inputNode.input);
+      await this.audioEffects.applyEffect("none", null);
+      console.log("✓ Microphone started");
+    } catch (error) {
+      // Mejorar mensajes de error
+      let errorMessage = "Error accessing microphone: ";
+
+      if (
+        error.name === "NotAllowedError" ||
+        error.name === "PermissionDeniedError"
+      ) {
+        errorMessage += "Permission denied. Please allow microphone access.";
+      } else if (
+        error.name === "NotFoundError" ||
+        error.name === "DevicesNotFoundError"
+      ) {
+        errorMessage += "No microphone found. Please connect a microphone.";
+      } else if (
+        error.name === "NotReadableError" ||
+        error.name === "TrackStartError"
+      ) {
+        errorMessage += "Microphone is being used by another application.";
+      } else if (error.name === "OverconstrainedError") {
+        errorMessage += "Microphone doesn't support the requested settings.";
+      } else {
+        errorMessage += error.message;
+      }
+
+      throw new Error(errorMessage);
+    }
+  }
+
+  stop() {
+    if (this.mediaStream) {
+      this.mediaStream.getTracks().forEach((t) => t.stop());
+      this.mediaStream = null;
+    }
+    if (this.mediaStreamSource) {
+      this.mediaStreamSource.disconnect();
+      this.mediaStreamSource = null;
+    }
+    console.log("✓ Microphone stopped");
+  }
+
+  toggleMute() {
+    this.isMuted = !this.isMuted;
+    if (this.mediaStream) {
+      this.mediaStream
+        .getAudioTracks()
+        .forEach((track) => (track.enabled = !this.isMuted));
+    }
+    return this.isMuted;
+  }
+
+  setEnabled(enabled) {
+    if (this.mediaStream) {
+      this.mediaStream
+        .getAudioTracks()
+        .forEach((track) => (track.enabled = enabled));
+    }
+  }
+
+  getStream() {
+    return this.mediaStream;
+  }
+
+  isMicMuted() {
+    return this.isMuted;
+  }
+
+  // NUEVO: Cambiar el dispositivo de micrófono
+  async changeMicrophone(deviceId) {
+    console.log(`🎤 Changing microphone to: ${deviceId}`);
+
+    // Detener el micrófono actual
+    this.stop();
+
+    // Iniciar con el nuevo dispositivo
+    try {
+      // Modificar las constraints para usar el deviceId específico
+      const constraints = {
+        audio: {
+          deviceId: deviceId ? { exact: deviceId } : undefined,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      };
+
+      this.mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+      const audioContext = Tone.context.rawContext || Tone.context._context;
+
+      this.mediaStreamSource = audioContext.createMediaStreamSource(
+        this.mediaStream
+      );
+      const inputNode = this.audioEffects.createInputNode(1.0);
+
+      this.mediaStreamSource.connect(inputNode.input);
+      await this.audioEffects.applyEffect("none", null);
+
+      console.log("✓ Microphone changed successfully");
+      return true;
+    } catch (error) {
+      console.error("❌ Error changing microphone:", error);
+      throw error;
+    }
+  }
+
+  // NUEVO: Obtener lista de dispositivos de audio disponibles
+  static async getAudioDevices() {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const audioInputs = devices.filter(
+        (device) => device.kind === "audioinput"
+      );
+      console.log(`🎤 Found ${audioInputs.length} audio input devices`);
+      return audioInputs;
+    } catch (error) {
+      console.error("❌ Error getting audio devices:", error);
+      return [];
+    }
+  }
+}
+
+// =====================================================
+// CLASE: Participant
+// Representa a un participante en la llamada
 // =====================================================
 class Participant {
   constructor(gamertag, isSelf = false) {
@@ -371,34 +696,63 @@ class Participant {
     this.volume = 1;
     this.gainNode = null;
     this.audioElement = null;
+    this.source = null;
     this.customVolume = 1;
-    this.skinUrl = `https://mc-api.io/render/face/${encodeURIComponent(gamertag)}/bedrock`;
-    this.isTalking = false;
+    this.skinUrl = this.generateSkinUrl(gamertag); // NUEVO: URL de la skin
   }
 
-  setAudioNodes(gainNode, audioElement) {
+  // NUEVO: Generar URL de la skin usando mc-api.io
+  generateSkinUrl(gamertag) {
+    // Usar el endpoint de mc-api.io para Bedrock
+    return `https://mc-api.io/render/face/${encodeURIComponent(
+      gamertag
+    )}/bedrock`;
+  }
+
+  setAudioNodes(gainNode, audioElement, source) {
     this.gainNode = gainNode;
     this.audioElement = audioElement;
+    this.source = source;
   }
 
-  updateVolume(v) {
-    const final = v * this.customVolume;
-    this.volume = final;
-    if (this.gainNode) this.gainNode.gain.value = final;
-    else if (this.audioElement) this.audioElement.volume = Math.min(1, final);
+  setCustomVolume(volume) {
+    this.customVolume = volume;
   }
 
-  setAudioOutput(deviceId) {
-    if (this.audioElement && this.audioElement.setSinkId) {
-      this.audioElement.setSinkId(deviceId).catch(e => console.warn('setSinkId error:', e));
+  updateVolume(newVolume) {
+    const outputGain = window._enviroOutputVolume !== undefined ? window._enviroOutputVolume : 1.0;
+    const finalVolume = newVolume * this.customVolume;
+    this.volume = finalVolume;
+
+    if (this.gainNode) {
+      // Native WebAudio GainNode supports values > 1.0 (above 100%)
+      this.gainNode.gain.value = finalVolume * outputGain;
+    } else if (this.audioElement) {
+      this.audioElement.volume = Math.min(1, finalVolume * outputGain);
     }
   }
 
+  updateDistance(distance) {
+    this.distance = distance;
+  }
+
   cleanup() {
+    if (this.source) {
+      try {
+        this.source.disconnect();
+      } catch (e) {}
+    }
+    if (this.gainNode) {
+      try {
+        this.gainNode.disconnect();
+      } catch (e) {}
+    }
     if (this.audioElement) {
-      this.audioElement.pause();
-      this.audioElement.srcObject = null;
-      this.audioElement.remove();
+      try {
+        this.audioElement.pause();
+        this.audioElement.srcObject = null;
+        this.audioElement.remove();
+      } catch (e) {}
     }
   }
 
@@ -408,14 +762,14 @@ class Participant {
       isSelf: this.isSelf,
       distance: Math.round(this.distance),
       volume: this.volume,
-      skinUrl: this.skinUrl,
-      isTalking: this.isTalking,
+      skinUrl: this.skinUrl, // NUEVO: Incluir URL de la skin
     };
   }
 }
 
 // =====================================================
-// CLASS: ParticipantsManager
+// CLASE: ParticipantsManager
+// Gestiona todos los participantes
 // =====================================================
 class ParticipantsManager {
   constructor() {
@@ -425,41 +779,65 @@ class ParticipantsManager {
 
   add(gamertag, isSelf = false) {
     if (this.participants.has(gamertag)) return;
-    const p = new Participant(gamertag, isSelf);
-    const pending = this.pendingNodes.get(gamertag);
-    if (pending) {
-      p.setAudioNodes(pending.gainNode, pending.audioElement);
-      p.updateVolume(1); // default to audible until Minecraft adjusts distance volume
+
+    const participant = new Participant(gamertag, isSelf);
+
+    // Verificar si hay nodos pendientes
+    const pendingData = this.pendingNodes.get(gamertag);
+    if (pendingData) {
+      participant.setAudioNodes(
+        pendingData.gainNode,
+        pendingData.audioElement,
+        pendingData.source
+      );
+      if (pendingData.gainNode) {
+        pendingData.gainNode.gain.value = 1;
+      }
       this.pendingNodes.delete(gamertag);
+      console.log(`✓ Audio nodes assigned to ${gamertag}`);
     }
-    this.participants.set(gamertag, p);
+
+    this.participants.set(gamertag, participant);
   }
 
   remove(gamertag) {
-    const p = this.participants.get(gamertag);
-    if (p) { p.cleanup(); this.participants.delete(gamertag); }
+    const participant = this.participants.get(gamertag);
+    if (participant) {
+      participant.cleanup();
+      this.participants.delete(gamertag);
+    }
   }
 
-  get(gamertag) { return this.participants.get(gamertag); }
-  has(gamertag) { return this.participants.has(gamertag); }
-  getAll() { return Array.from(this.participants.values()); }
-  forEach(cb) { this.participants.forEach(cb); }
+  get(gamertag) {
+    return this.participants.get(gamertag);
+  }
 
-  addPendingNode(gamertag, data) { this.pendingNodes.set(gamertag, data); }
+  has(gamertag) {
+    return this.participants.has(gamertag);
+  }
+
+  getAll() {
+    return Array.from(this.participants.values());
+  }
 
   clear() {
-    this.participants.forEach(p => p.cleanup());
+    this.participants.forEach((p) => p.cleanup());
     this.participants.clear();
     this.pendingNodes.clear();
   }
 
-  setOutputDevice(deviceId) {
-    this.participants.forEach(p => { if (!p.isSelf) p.setAudioOutput(deviceId); });
+  addPendingNode(gamertag, nodeData) {
+    this.pendingNodes.set(gamertag, nodeData);
+  }
+
+  forEach(callback) {
+    this.participants.forEach(callback);
   }
 }
 
 // =====================================================
-// CLASS: WebRTCManager
+// CLASE: WebRTCManager
+// Maneja las conexiones WebRTC peer-to-peer
 // =====================================================
 class WebRTCManager {
   constructor(participantsManager, audioEffects, minecraft, onTrackReceived) {
@@ -469,208 +847,425 @@ class WebRTCManager {
     this.minecraft = minecraft;
     this.onTrackReceived = onTrackReceived;
     this.ws = null;
-    this.currentGamertag = '';
-    this.outputDeviceId = null;
+    this.currentGamertag = "";
   }
 
-  setWebSocket(ws) { this.ws = ws; }
-  setGamertag(gt) { this.currentGamertag = gt; }
-  setOutputDevice(deviceId) { this.outputDeviceId = deviceId; }
+  setWebSocket(ws) {
+    this.ws = ws;
+  }
 
-  async createPeerConnection(remoteGt) {
-    if (this.peerConnections.has(remoteGt)) return this.peerConnections.get(remoteGt);
+  setGamertag(gamertag) {
+    this.currentGamertag = gamertag;
+  }
 
+  async createPeerConnection(remoteGamertag) {
+    if (this.peerConnections.has(remoteGamertag)) {
+      console.log(`⚠️ Already exists connection with ${remoteGamertag}`);
+      return this.peerConnections.get(remoteGamertag);
+    }
+
+    // ✅ AHORA (STUN + TURN):
     const pc = new RTCPeerConnection({
       iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-        { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
-        { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
-      ]
+        // STUN servers (para descubrir IP pública)
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun1.l.google.com:19302" },
+
+        // TURN servers GRATUITOS (para VPN/NAT estricto)
+        {
+          urls: "turn:openrelay.metered.ca:80",
+          username: "openrelayproject",
+          credential: "openrelayproject",
+        },
+        {
+          urls: "turn:openrelay.metered.ca:443",
+          username: "openrelayproject",
+          credential: "openrelayproject",
+        },
+        {
+          urls: "turn:openrelay.metered.ca:443?transport=tcp",
+          username: "openrelayproject",
+          credential: "openrelayproject",
+        },
+      ],
     });
 
+    // ICE candidates
+    pc.onicecandidate = (e) => {
+      if (e.candidate && this.ws && this.ws.readyState === 1) {
+        this.ws.send(
+          JSON.stringify({
+            type: "ice-candidate",
+            candidate: e.candidate,
+            from: this.currentGamertag,
+            to: remoteGamertag,
+          })
+        );
+      }
+    };
+
+    // Bandera para controlar renegociación
     pc._isInitialConnection = true;
     pc._reconnectAttempts = 0;
 
-    pc.onicecandidate = (e) => {
-      if (e.candidate && this.ws?.readyState === 1) {
-        this.ws.send(JSON.stringify({ type: 'ice-candidate', candidate: e.candidate, from: this.currentGamertag, to: remoteGt }));
-      }
-    };
-
+    // Manejo de renegociación - SOLO cuando la conexión ya está establecida
     pc.onnegotiationneeded = async () => {
-      if (pc._isInitialConnection || pc.signalingState !== 'stable') return;
+      // Ignorar durante la conexión inicial
+      if (pc._isInitialConnection) {
+        console.log(
+          `⏳ Skipping renegotiation with ${remoteGamertag} (initial connection in progress)`
+        );
+        return;
+      }
+
+      console.log(`🔄 Renegotiation needed with ${remoteGamertag}`);
       try {
+        if (pc.signalingState !== "stable") {
+          console.log(
+            `⚠️ Signaling state is ${pc.signalingState}, skipping renegotiation`
+          );
+          return;
+        }
+
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
-        if (this.ws?.readyState === 1) {
-          this.ws.send(JSON.stringify({ type: 'offer', offer, from: this.currentGamertag, to: remoteGt }));
+
+        if (this.ws && this.ws.readyState === 1) {
+          this.ws.send(
+            JSON.stringify({
+              type: "offer",
+              offer: offer,
+              from: this.currentGamertag,
+              to: remoteGamertag,
+            })
+          );
+          console.log(`✓ Renegotiation offer sent to ${remoteGamertag}`);
         }
-      } catch(e) { console.error('Renegotiation error:', e); }
+      } catch (e) {
+        console.error(`❌ Renegotiation failed with ${remoteGamertag}:`, e);
+      }
     };
 
+    // Audio entrante
     pc.ontrack = (event) => {
-      const audio = document.createElement('audio');
-      audio.srcObject = event.streams[0];
-      audio.autoplay = true;
-      audio.volume = 1;
-      audio.id = `audio-${remoteGt}`;
-      audio.style.display = 'none';
-      document.body.appendChild(audio);
+      console.log(`🎵 ${remoteGamertag} connected`);
 
-      if (this.outputDeviceId && audio.setSinkId) {
-        audio.setSinkId(this.outputDeviceId).catch(() => {});
-      }
+      const remoteStream = event.streams[0];
 
-      audio.play().catch((err) => {
-        console.warn('audio.play() failed, will retry on user gesture:', err);
-        const resume = () => { audio.play().catch(() => {}); document.removeEventListener('click', resume); };
-        document.addEventListener('click', resume);
+      // Use a native WebAudio GainNode so output volume can exceed 100%
+      const remoteAudioCtx = Tone.context.rawContext || Tone.context._context;
+      const remoteSource = remoteAudioCtx.createMediaStreamSource(remoteStream);
+      const remoteGain = remoteAudioCtx.createGain();
+      remoteGain.gain.value = 1.0;
+      remoteSource.connect(remoteGain);
+      remoteGain.connect(remoteAudioCtx.destination);
+
+      // Silent <audio> to keep stream alive and satisfy autoplay policy
+      const audioElement = document.createElement("audio");
+      audioElement.srcObject = remoteStream;
+      audioElement.autoplay = true;
+      audioElement.volume = 0;
+      audioElement.id = `audio-${remoteGamertag}`;
+      audioElement.style.display = "none";
+      document.body.appendChild(audioElement);
+      audioElement.play().catch(() => {
+        const resume = () => { audioElement.play().catch(() => {}); document.removeEventListener("click", resume); };
+        document.addEventListener("click", resume);
       });
 
-      const p = this.participantsManager.get(remoteGt);
-      if (p) {
-        p.setAudioNodes(null, audio);
-        // Only set volume to 1 here; Minecraft integration will adjust if data is available
-        p.updateVolume(1);
+      const participant = this.participantsManager.get(remoteGamertag);
+      if (participant) {
+        participant.setAudioNodes(remoteGain, audioElement, remoteSource);
+        participant.updateVolume(1); // Full volume by default
+        setTimeout(() => {
+          if (this.minecraft && this.minecraft.isInGame()) this.minecraft.processUpdate();
+        }, 500);
       } else {
-        this.participantsManager.addPendingNode(remoteGt, { gainNode: null, audioElement: audio });
+        this.participantsManager.addPendingNode(remoteGamertag, {
+          gainNode: remoteGain,
+          audioElement,
+          source: remoteSource,
+        });
       }
-
-      if (this.onTrackReceived) this.onTrackReceived(remoteGt);
     };
 
     pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'connected') {
+      console.log(
+        `🔌 ${remoteGamertag} - Connection state: ${pc.connectionState}`
+      );
+
+      if (pc.connectionState === "disconnected") {
+        console.log(`🔌 ${remoteGamertag} disconnected`);
+      }
+
+      if (pc.connectionState === "failed") {
+        console.log(
+          `❌ ${remoteGamertag} connection failed - attempting reconnection...`
+        );
+        this.attemptReconnect(remoteGamertag);
+      }
+
+      if (pc.connectionState === "connected") {
+        console.log(`✅ ${remoteGamertag} - Connection fully established`);
         pc._isInitialConnection = false;
         pc._reconnectAttempts = 0;
-        setTimeout(() => this.minecraft?.processUpdate(), 500);
-      }
-      if (pc.connectionState === 'failed') this._attemptReconnect(remoteGt);
-    };
 
-    pc.oniceconnectionstatechange = () => {
-      if (pc.iceConnectionState === 'failed') pc.restartIce();
-    };
-
-    const stream = this.audioEffects.getProcessedStream();
-    if (stream) {
-      stream.getTracks().forEach(t => pc.addTrack(t, stream));
-    } else {
-      // Fallback: add raw mic stream if audio effects haven't initialized yet
-      const rawStream = this.audioEffects.inputNode?._context
-        ? null
-        : null;
-      // Schedule a re-add once the processed stream is ready
-      const waitForStream = setInterval(() => {
-        const s = this.audioEffects.getProcessedStream();
-        if (s && pc.signalingState !== 'closed') {
-          clearInterval(waitForStream);
-          const senders = pc.getSenders();
-          if (senders.length === 0) {
-            s.getTracks().forEach(t => pc.addTrack(t, s));
+        setTimeout(() => {
+          if (this.minecraft && this.minecraft.isInGame()) {
+            this.minecraft.processUpdate();
           }
-        }
-      }, 100);
-      // Give up after 5 seconds
-      setTimeout(() => clearInterval(waitForStream), 5000);
+        }, 500);
+      }
+    };
+
+    // MEJORADO: Manejo de estado ICE con restart automático
+    pc.oniceconnectionstatechange = () => {
+      console.log(`❄️ ${remoteGamertag} - ICE: ${pc.iceConnectionState}`);
+
+      if (
+        pc.iceConnectionState === "connected" ||
+        pc.iceConnectionState === "completed"
+      ) {
+        console.log(
+          `✅ ${remoteGamertag} - ICE connection established successfully`
+        );
+        setTimeout(() => {
+          if (this.minecraft && this.minecraft.isInGame()) {
+            this.minecraft.processUpdate();
+          }
+        }, 500);
+      }
+
+      if (pc.iceConnectionState === "failed") {
+        console.log(`❌ ${remoteGamertag} - ICE failed, attempting restart`);
+        pc.restartIce();
+      }
+    };
+
+    // Añadir audio local
+    const processedStream = this.audioEffects.getProcessedStream();
+    if (processedStream) {
+      processedStream.getTracks().forEach((track) => {
+        pc.addTrack(track, processedStream);
+      });
     }
 
-    this.peerConnections.set(remoteGt, pc);
+    this.peerConnections.set(remoteGamertag, pc);
+    console.log(`🔗 ${remoteGamertag} connecting...`);
+
     return pc;
   }
 
-  async _attemptReconnect(remoteGt) {
-    const oldPc = this.peerConnections.get(remoteGt);
+  async attemptReconnect(remoteGamertag) {
+    const oldPc = this.peerConnections.get(remoteGamertag);
     const attempts = (oldPc?._reconnectAttempts || 0) + 1;
-    if (attempts > 3) return;
-    this.closePeerConnection(remoteGt);
-    await new Promise(r => setTimeout(r, 1000));
+
+    if (attempts > 3) {
+      console.log(
+        `❌ ${remoteGamertag} - Max reconnection attempts reached (3)`
+      );
+      return;
+    }
+
+    console.log(`🔄 ${remoteGamertag} - Reconnection attempt ${attempts}/3`);
+
+    this.closePeerConnection(remoteGamertag);
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+
     try {
-      const pc = await this.createPeerConnection(remoteGt);
+      const pc = await this.createPeerConnection(remoteGamertag);
       pc._reconnectAttempts = attempts;
+
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      if (this.ws?.readyState === 1) {
-        this.ws.send(JSON.stringify({ type: 'offer', offer, from: this.currentGamertag, to: remoteGt }));
-      }
-    } catch(e) {}
-  }
 
-  async reconnectAllPeers() {
-    const gts = Array.from(this.peerConnections.keys());
-    this.closeAllConnections();
-    await new Promise(r => setTimeout(r, 500));
-    for (const gt of gts) {
-      try {
-        const pc = await this.createPeerConnection(gt);
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        if (this.ws?.readyState === 1) {
-          this.ws.send(JSON.stringify({ type: 'offer', offer, from: this.currentGamertag, to: gt }));
-        }
-        await new Promise(r => setTimeout(r, 300));
-      } catch(e) {}
+      if (this.ws && this.ws.readyState === 1) {
+        this.ws.send(
+          JSON.stringify({
+            type: "offer",
+            offer: offer,
+            from: this.currentGamertag,
+            to: remoteGamertag,
+          })
+        );
+      }
+    } catch (e) {
+      console.error(`❌ Reconnection failed with ${remoteGamertag}:`, e);
     }
   }
 
-  closePeerConnection(gt) {
-    const pc = this.peerConnections.get(gt);
-    if (pc) { pc.close(); this.peerConnections.delete(gt); }
+  async reconnectAllPeers() {
+    console.log("🔄 RECONNECTING ALL PEERS...");
+
+    const gamertags = Array.from(this.peerConnections.keys());
+
+    if (gamertags.length === 0) {
+      console.log("✓ No peers to reconnect");
+      return;
+    }
+
+    console.log(`📋 Peers to reconnect: ${gamertags.join(", ")}`);
+
+    this.closeAllConnections();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    for (const gamertag of gamertags) {
+      try {
+        console.log(`🔗 Reconnecting with ${gamertag}...`);
+        const pc = await this.createPeerConnection(gamertag);
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+
+        if (this.ws && this.ws.readyState === 1) {
+          this.ws.send(
+            JSON.stringify({
+              type: "offer",
+              offer: offer,
+              from: this.currentGamertag,
+              to: gamertag,
+            })
+          );
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      } catch (e) {
+        console.error(`❌ Failed to reconnect with ${gamertag}:`, e);
+      }
+    }
+
+    console.log("✅ Reconnection process complete");
+  }
+
+  closePeerConnection(gamertag) {
+    const pc = this.peerConnections.get(gamertag);
+    if (pc) {
+      pc.close();
+      this.peerConnections.delete(gamertag);
+      console.log(`🔌 Connection closed with ${gamertag}`);
+    }
   }
 
   closeAllConnections() {
-    this.peerConnections.forEach((_, gt) => this.closePeerConnection(gt));
+    this.peerConnections.forEach((pc, gamertag) => {
+      this.closePeerConnection(gamertag);
+    });
   }
 
-  getPeerConnection(gt) { return this.peerConnections.get(gt); }
+  getPeerConnection(gamertag) {
+    return this.peerConnections.get(gamertag);
+  }
+
+  forEach(callback) {
+    this.peerConnections.forEach(callback);
+  }
+
+  // NUEVO: Actualizar el stream de micrófono en todas las conexiones activas
+  async updateMicrophoneStream(newStream) {
+    console.log("🔄 Updating microphone stream in all peer connections...");
+
+    if (!newStream) {
+      console.error("❌ No new stream provided");
+      return;
+    }
+
+    const audioTrack = newStream.getAudioTracks()[0];
+    if (!audioTrack) {
+      console.error("❌ No audio track in new stream");
+      return;
+    }
+
+    // Actualizar el track en todas las conexiones activas
+    this.peerConnections.forEach((pc, gamertag) => {
+      const senders = pc.getSenders();
+      const audioSender = senders.find(
+        (sender) => sender.track?.kind === "audio"
+      );
+
+      if (audioSender) {
+        audioSender
+          .replaceTrack(audioTrack)
+          .then(() => {
+            console.log(`✓ Updated audio track for ${gamertag}`);
+          })
+          .catch((error) => {
+            console.error(`❌ Error updating track for ${gamertag}:`, error);
+          });
+      }
+    });
+
+    console.log("✓ Microphone stream updated in all connections");
+  }
 }
 
 // =====================================================
-// CLASS: DistanceCalculator
+// CLASE: DistanceCalculator
+// Calcula distancias y volumen basado en posición 3D
 // =====================================================
 class DistanceCalculator {
-  constructor(maxDistance = 20) { this.maxDistance = maxDistance; }
-
-  calculate(p1, p2) {
-    const dx = p1.x - p2.x, dy = p1.y - p2.y, dz = p1.z - p2.z;
-    return Math.sqrt(dx*dx + dy*dy + dz*dz);
+  constructor(maxDistance = 20) {
+    this.maxDistance = maxDistance;
   }
 
-  volumeFromDistance(d) {
-    if (d > this.maxDistance) return 0;
-    return Math.pow(1 - d / this.maxDistance, 2);
+  calculate(pos1, pos2) {
+    const dx = pos1.x - pos2.x;
+    const dy = pos1.y - pos2.y;
+    const dz = pos1.z - pos2.z;
+    return Math.sqrt(dx * dx + dy * dy + dz * dz);
+  }
+
+  volumeFromDistance(distance) {
+    if (distance > this.maxDistance) return 0;
+    return Math.pow(1 - distance / this.maxDistance, 2);
   }
 }
 
 // =====================================================
-// CLASS: MinecraftIntegration
+// CLASE: MinecraftIntegration
+// Maneja la integración con Minecraft
 // =====================================================
 class MinecraftIntegration {
-  constructor(participantsManager, audioEffects, micManager, distanceCalculator, webrtcManager) {
+  constructor(
+    participantsManager,
+    audioEffects,
+    micManager,
+    distanceCalculator,
+    webrtcManager
+  ) {
     this.participantsManager = participantsManager;
     this.audioEffects = audioEffects;
     this.micManager = micManager;
     this.distanceCalculator = distanceCalculator;
     this.webrtcManager = webrtcManager;
     this.minecraftData = null;
-    this.currentGamertag = '';
+    this.currentGamertag = "";
     this.isPlayerInGame = false;
     this.remoteMuted = false;
     this.remoteDeafened = false;
+    this.onMuteChange = null;
+    this.onDeafenChange = null;
+    this.playerVolumes = new Map();
     this.pushToTalkManager = null;
     this.lastMicVolume = null;
     this.lastEffectChange = 0;
     this.effectThrottleMs = 1000;
-    this.onMuteChange = null;
-    this.onDeafenChange = null;
   }
 
-  setPushToTalkManager(ptt) { this.pushToTalkManager = ptt; }
-  setGamertag(gt) { this.currentGamertag = gt; }
-  setOnMuteChange(cb) { this.onMuteChange = cb; }
-  setOnDeafenChange(cb) { this.onDeafenChange = cb; }
+  // NUEVO: Establecer referencia al PTT manager
+  setPushToTalkManager(pttManager) {
+    this.pushToTalkManager = pttManager;
+  }
+
+  setGamertag(gamertag) {
+    this.currentGamertag = gamertag;
+  }
+
+  setOnMuteChange(callback) {
+    this.onMuteChange = callback;
+  }
+
+  setOnDeafenChange(callback) {
+    this.onDeafenChange = callback;
+  }
 
   updateData(data) {
     this.minecraftData = data;
@@ -679,212 +1274,484 @@ class MinecraftIntegration {
 
   processUpdate() {
     if (!this.minecraftData || !this.currentGamertag) return;
-    const playersList = Array.isArray(this.minecraftData) ? this.minecraftData : this.minecraftData.players;
-    if (!playersList) return;
 
-    if (this.minecraftData.config?.maxDistance) {
-      this.distanceCalculator.maxDistance = this.minecraftData.config.maxDistance;
+    const playersList = Array.isArray(this.minecraftData)
+      ? this.minecraftData
+      : this.minecraftData.players;
+
+    // Actualizar distancia máxima si viene en la config
+    if (this.minecraftData.config && this.minecraftData.config.maxDistance) {
+      const newMaxDistance = this.minecraftData.config.maxDistance;
+      if (this.distanceCalculator.maxDistance !== newMaxDistance) {
+        console.log(
+          `📏 Max distance updated: ${this.distanceCalculator.maxDistance} → ${newMaxDistance}`
+        );
+        this.distanceCalculator.maxDistance = newMaxDistance;
+      }
     }
 
-    const myPlayer = playersList.find(p => p.name.trim().toLowerCase() === this.currentGamertag.trim().toLowerCase());
+    const myPlayer = playersList.find(
+      (p) =>
+        p.name.trim().toLowerCase() ===
+        this.currentGamertag.trim().toLowerCase()
+    );
+
     const wasInGame = this.isPlayerInGame;
     this.isPlayerInGame = !!myPlayer;
 
     if (!myPlayer) {
-      if (wasInGame) console.log('Disconnected from Minecraft server');
-      // Don't mute mic or audio — just note we're not in game
-      // (user may still want to hear/talk to others outside of game)
+      this.handlePlayerNotInGame(wasInGame);
       return;
     }
 
-    const nowMuted = myPlayer.data?.isMuted || false;
-    if (nowMuted !== this.remoteMuted) {
-      this.remoteMuted = nowMuted;
-      if (this.onMuteChange) this.onMuteChange(this.remoteMuted);
+    if (!wasInGame) {
+      console.log("✓ Connected to Minecraft server");
     }
 
-    const nowDeafened = myPlayer.data?.isDeafened || false;
-    if (nowDeafened !== this.remoteDeafened) {
-      this.remoteDeafened = nowDeafened;
-      if (this.onDeafenChange) this.onDeafenChange(this.remoteDeafened);
-    }
+    // Manejar mute desde Minecraft
+    const remoteMutedNow = myPlayer.data.isMuted || false;
+    if (remoteMutedNow !== this.remoteMuted) {
+      this.remoteMuted = remoteMutedNow;
+      console.log(
+        `🎤 Remote mute changed: ${this.remoteMuted ? "MUTED" : "UNMUTED"}`
+      );
 
-    if (myPlayer.data?.micVolume !== undefined && myPlayer.data.micVolume !== this.lastMicVolume) {
-      this.lastMicVolume = myPlayer.data.micVolume;
-      this.audioEffects.updateVolume(myPlayer.data.micVolume);
-    }
-
-    if (!this.pushToTalkManager?.isEnabled()) {
-      this.micManager.setEnabled(!this.micManager.isMicMuted() && !this.remoteMuted);
-    }
-
-    // Environmental effects
-    const now = Date.now();
-    if (now - this.lastEffectChange >= this.effectThrottleMs) {
-      this.lastEffectChange = now;
-      let fx = 'none';
-      if (myPlayer.data?.isUnderWater) fx = 'underwater';
-      else if (myPlayer.data?.isInCave) fx = 'cave';
-      else if (myPlayer.data?.isInMountain) fx = 'mountain';
-      else if (myPlayer.data?.isBuried) fx = 'buried';
-      if (fx !== this.audioEffects.getCurrentEffect()) {
-        this.audioEffects.applyEffect(fx, this.webrtcManager?.peerConnections);
+      if (this.onMuteChange) {
+        this.onMuteChange(this.remoteMuted);
       }
     }
 
-    // Update participant volumes
+    // Manejar deafen desde Minecraft
+    const remoteDeafenedNow = myPlayer.data.isDeafened || false;
+    if (remoteDeafenedNow !== this.remoteDeafened) {
+      this.remoteDeafened = remoteDeafenedNow;
+      console.log(
+        `🔇 Remote deafen changed: ${
+          this.remoteDeafened ? "DEAFENED" : "UNDEAFENED"
+        }`
+      );
+
+      if (this.onDeafenChange) {
+        this.onDeafenChange(this.remoteDeafened);
+      }
+    }
+
+    // MEJORADO: Aplicar volumen del micrófono solo si cambió
+    if (
+      myPlayer.data.micVolume !== undefined &&
+      myPlayer.data.micVolume !== this.lastMicVolume
+    ) {
+      const micVolume = myPlayer.data.micVolume;
+      this.lastMicVolume = micVolume;
+      this.audioEffects.updateVolume(
+        micVolume,
+        this.webrtcManager?.peerConnections
+      );
+      console.log(
+        `🎚️ Microphone volume updated: ${(micVolume * 100).toFixed(0)}%`
+      );
+    }
+
+    // Aplicar volúmenes personalizados a los participantes
+    if (myPlayer.data.customVolumes) {
+      this.applyCustomVolumes(myPlayer.data.customVolumes);
+    }
+
+    // MEJORADO: Considerar Push-to-Talk al aplicar estado de mute
+    const shouldBeMuted = this.micManager.isMicMuted() || this.remoteMuted;
+
+    // Si PTT está activo, el micrófono está COMPLETAMENTE controlado por PTT
+    // Minecraft NO debe interferir con el estado del micrófono
+    if (!this.pushToTalkManager || !this.pushToTalkManager.isEnabled()) {
+      // PTT no está activo - Minecraft controla el mute normalmente
+      this.micManager.setEnabled(!shouldBeMuted);
+    }
+    // Si PTT está activo, NO hacemos nada aquí
+    // PTT maneja todo el control de mute/unmute a través de las teclas
+
+    this.applyEnvironmentalEffects(myPlayer);
+    this.updateParticipantVolumes(myPlayer, playersList);
+  }
+
+  // NUEVO: Aplicar volúmenes personalizados a cada participante
+  applyCustomVolumes(customVolumes) {
     this.participantsManager.forEach((participant, gamertag) => {
       if (participant.isSelf) return;
-      const other = playersList.find(pl => pl.name.trim().toLowerCase() === gamertag.trim().toLowerCase());
-      if (other && !other.data?.isMuted && !this.remoteDeafened) {
-        const dist = this.distanceCalculator.calculate(myPlayer.location, other.location);
-        const vol = this.distanceCalculator.volumeFromDistance(dist);
-        participant.distance = dist;
-        participant.updateVolume(vol);
+
+      // Buscar el volumen personalizado para este jugador
+      const customVolume = customVolumes[gamertag];
+      if (customVolume !== undefined) {
+        participant.setCustomVolume(customVolume);
+      }
+    });
+  }
+
+  handlePlayerNotInGame(wasInGame) {
+    if (wasInGame) console.log("❌ Disconnected from Minecraft server");
+    // Don't silence audio — user is still in the voice chat room
+  }
+
+  applyEnvironmentalEffects(myPlayer) {
+    const now = Date.now();
+    if (now - this.lastEffectChange < this.effectThrottleMs) {
+      return;
+    }
+    this.lastEffectChange = now;
+    let targetEffect = "none";
+
+    if (myPlayer.data.isUnderWater) targetEffect = "underwater";
+    else if (myPlayer.data.isInCave) targetEffect = "cave";
+    else if (myPlayer.data.isInMountain) targetEffect = "mountain";
+    else if (myPlayer.data.isBuried) targetEffect = "buried";
+
+    if (targetEffect !== this.audioEffects.getCurrentEffect()) {
+      // ARREGLADO: Pasar las peer connections correctamente
+      const peerConnections = this.webrtcManager?.peerConnections;
+      this.audioEffects.applyEffect(targetEffect, peerConnections);
+    }
+  }
+
+  updateParticipantVolumes(myPlayer, playersList) {
+    this.participantsManager.forEach((participant, gamertag) => {
+      if (participant.isSelf) return;
+
+      const otherPlayer = playersList.find(
+        (pl) => pl.name.trim().toLowerCase() === gamertag.trim().toLowerCase()
+      );
+
+      if (otherPlayer) {
+        // Si el otro jugador está muteado, volumen = 0
+        if (otherPlayer.data.isMuted) {
+          participant.updateDistance(0);
+          participant.updateVolume(0);
+          return;
+        }
+
+        // Si YO estoy ensordecido, no escucho a nadie
+        if (this.remoteDeafened) {
+          participant.updateVolume(0);
+          return;
+        }
+
+        const distance = this.distanceCalculator.calculate(
+          myPlayer.location,
+          otherPlayer.location
+        );
+        const volume = this.distanceCalculator.volumeFromDistance(distance);
+
+        participant.updateDistance(distance);
+        participant.updateVolume(volume);
       } else {
         participant.updateVolume(0);
       }
     });
   }
 
-  isInGame() { return this.isPlayerInGame; }
+  isInGame() {
+    return this.isPlayerInGame;
+  }
+
+  isRemoteMuted() {
+    return this.remoteMuted;
+  }
+
+  // NUEVO: Verificar si está ensordecido remotamente
+  isRemoteDeafened() {
+    return this.remoteDeafened;
+  }
 }
 
 // =====================================================
-// CLASS: UIManager (Rebuilt)
+// CLASE: UIManager
+// Maneja toda la interfaz de usuario
 // =====================================================
 class UIManager {
   constructor() {
-    this.els = {
-      gamertagInput:      document.getElementById('gamertagInput'),
-      gamertagStatus:     document.getElementById('gamertagStatus'),
-      roomUrlInput:       document.getElementById('roomUrlInput'),
-      connectBtn:         document.getElementById('connectToRoomBtn'),
-      roomInfo:           document.getElementById('roomInfo'),
-      callControls:       document.getElementById('callControls'),
-      setupSection:       document.getElementById('setupSection'),
-      exitBtn:            document.getElementById('exitBtn'),
-      micToggleBtn:       document.getElementById('micToggleBtn'),
-      gameStatus:         document.getElementById('gameStatus'),
-      participantsList:   document.getElementById('participantsList'),
-      micSelector:        document.getElementById('micSelector'),
-      outputSelector:     document.getElementById('outputSelector'),
-      // PTT
-      pttToggle:          document.getElementById('pttToggle'),
-      pttModeOpen:        document.getElementById('pttModeOpen'),
-      pttKeyBtn:          document.getElementById('pttKeyBtn'),
-      pttKeyDisplay:      document.getElementById('pttKeyDisplay'),
-      pttSection:         document.getElementById('pttSection'),
-      pttKeyRow:          document.getElementById('pttKeyRow'),
-      // Hold-to-Talk
-      holdToTalkBtn:      document.getElementById('holdToTalkBtn'),
-      holdToTalkContainer: document.getElementById('holdToTalkContainer'),
+    this.elements = {
+      gamertagInput: document.getElementById("gamertagInput"),
+      gamertagStatus: document.getElementById("gamertagStatus"),
+      roomUrlInput: document.getElementById("roomUrlInput"),
+      connectBtn: document.getElementById("connectToRoomBtn"),
+      roomInfo: document.getElementById("roomInfo"),
+      callControls: document.getElementById("callControls"),
+      exitBtn: document.getElementById("exitBtn"),
+      participantsList: document.getElementById("participantsList"),
+      setupSection: document.getElementById("setupSection"),
+      gameStatus: document.getElementById("gameStatus"),
+      minecraftConnectContainer: document.createElement("div"),
+      // NUEVO: Elementos de Push-to-Talk
+      pttContainer: document.getElementById("pttContainer"),
+      pttToggle: document.getElementById("pttToggle"),
+      pttKeySelector: document.getElementById("pttKeySelector"),
+      pttKeyInput: document.getElementById("pttKeyInput"),
+      pttKeyDisplay: document.getElementById("pttKeyDisplay"),
+      // NUEVO: Selector de micrófono
+      micSelector: document.getElementById("micSelector"),
     };
-    this.isPC = this._detectPC();
+
+    this.elements.minecraftConnectContainer.id = "minecraftConnectContainer";
+    this.elements.gameStatus?.parentNode.insertBefore(
+      this.elements.minecraftConnectContainer,
+      this.elements.gameStatus.nextSibling
+    );
+
+    // Output volume slider (0–200%)
+    this.onOutputVolumeChange = null;
+    window._enviroOutputVolume = 1.0;
+    const _ovSlider = document.getElementById("outputVolumeSlider");
+    const _ovLabel  = document.getElementById("outputVolumeLabel");
+    if (_ovSlider) {
+      _ovSlider.addEventListener("input", (e) => {
+        const pct = parseInt(e.target.value, 10);
+        window._enviroOutputVolume = pct / 100;
+        if (_ovLabel) _ovLabel.textContent = pct + "%";
+        if (this.onOutputVolumeChange) this.onOutputVolumeChange(window._enviroOutputVolume);
+      });
+    }
+
+    this.isPC = this.detectPC();
+    if (this.isPC && this.elements.pttContainer) {
+      this.elements.pttContainer.style.display = "block";
+    }
   }
 
-  _detectPC() {
-    const isMobile = /android|webos|iphone|ipad|ipod|blackberry|iemobile|opera mini/i.test(navigator.userAgent.toLowerCase());
-    const isTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
-    return !isMobile || !isTouch;
+  setOnOutputVolumeChange(cb) { this.onOutputVolumeChange = cb; }
+
+  // NUEVO: Detectar si el usuario está en PC
+  detectPC() {
+    // Detectar por touch capability y tipo de dispositivo
+    const isTouchDevice =
+      "ontouchstart" in window || navigator.maxTouchPoints > 0;
+    const userAgent = navigator.userAgent.toLowerCase();
+    const isMobile =
+      /android|webos|iphone|ipad|ipod|blackberry|iemobile|opera mini/i.test(
+        userAgent
+      );
+
+    // Es PC si NO es táctil o NO es móvil
+    return !isTouchDevice || !isMobile;
   }
 
-  updateGamertagStatus(gt) {
-    const el = this.els.gamertagStatus;
-    if (!el) return;
-    el.textContent = gt ? `✓ ${gt}` : '⚠️ Enter your gamertag';
-    el.className = 'status-text ' + (gt ? 'ok' : 'warn');
+  updateGamertagStatus(gamertag) {
+    this.elements.gamertagStatus.textContent = gamertag
+      ? `✓ Gamertag: ${gamertag}`
+      : "⚠️ Enter your gamertag to continue";
+    this.elements.gamertagStatus.style.color = gamertag ? "#22c55e" : "#ef4444";
   }
 
-  updateRoomInfo(msg) {
-    if (this.els.roomInfo) this.els.roomInfo.textContent = msg;
+  updateRoomInfo(message) {
+    this.elements.roomInfo.textContent = message;
   }
 
   showCallControls(show) {
-    if (this.els.setupSection) this.els.setupSection.style.display = show ? 'none' : 'block';
-    if (this.els.callControls) this.els.callControls.style.display = show ? 'flex' : 'none';
-    if (this.els.holdToTalkContainer) this.els.holdToTalkContainer.style.display = show ? 'flex' : 'none';
-    if (show && this.isPC && this.els.pttSection) this.els.pttSection.style.display = 'block';
+    this.elements.setupSection.style.display = show ? "none" : "block";
+    this.elements.callControls.style.display = show ? "flex" : "none";
   }
 
   updateGameStatus(isInGame) {
-    const el = this.els.gameStatus;
-    if (!el) return;
-    el.innerHTML = isInGame
-      ? '<span class="status-dot ok"></span> Connected to Minecraft'
-      : '<span class="status-dot warn"></span> Not connected to Minecraft';
+    if (!this.elements.gameStatus) return;
+
+    if (isInGame) {
+      this.elements.gameStatus.innerHTML =
+        '<span style="color:#22c55e;">✓ Connected to Minecraft server</span>';
+      this.clearMinecraftConnectUI();
+    } else {
+      this.elements.gameStatus.innerHTML =
+        '<span style="color:#ef4444;">⚠️ Not connected to Minecraft server</span>';
+      this.showMinecraftConnectUI();
+    }
   }
 
-  updateParticipantsList(participants, voiceStates = {}) {
-    const el = this.els.participantsList;
-    if (!el) return;
-    el.innerHTML = '';
-    participants.forEach(p => {
+  showMinecraftConnectUI() {
+    const container = this.elements.minecraftConnectContainer;
+
+    let infoText = document.getElementById("mcInfoText");
+    if (!infoText) {
+      infoText = document.createElement("p");
+      infoText.id = "mcInfoText";
+      infoText.textContent =
+        "Haven't joined the server yet? Enter the IP and port here and we'll connect you!";
+      infoText.style.marginBottom = "8px";
+      container.appendChild(infoText);
+    }
+
+    let input = document.getElementById("mcServerInput");
+    if (!input) {
+      input = document.createElement("input");
+      input.type = "text";
+      input.id = "mcServerInput";
+      input.placeholder = "hive.net:19132";
+      input.className = "input-field";
+      input.style.marginRight = "10px";
+      container.appendChild(input);
+    }
+
+    const updateButton = () => {
+      const existingBtn = document.getElementById("mcConnectBtn");
+      if (input.value.trim() && !existingBtn) {
+        const btn = document.createElement("button");
+        btn.id = "mcConnectBtn";
+        btn.className = "primary-btn";
+        btn.textContent = "Connect to MC Server";
+        btn.addEventListener("click", () => {
+          const [ip, port] = input.value.split(":");
+          if (!ip || !port) {
+            alert("⚠️ Invalid format. Use IP:PORT");
+            return;
+          }
+          window.location.href = `minecraft://connect?serverUrl=${ip}&serverPort=${port}`;
+        });
+        container.appendChild(btn);
+      } else if (!input.value.trim()) {
+        const existingBtn = document.getElementById("mcConnectBtn");
+        if (existingBtn) existingBtn.remove();
+      }
+    };
+
+    input.removeEventListener("input", updateButton);
+    input.addEventListener("input", updateButton);
+  }
+
+  clearMinecraftConnectUI() {
+    const container = this.elements.minecraftConnectContainer;
+    container.innerHTML = "";
+  }
+
+  updateParticipantsList(participants) {
+    this.elements.participantsList.innerHTML = "";
+
+    participants.forEach((p) => {
       const info = p.getDisplayInfo();
-      const isTalking = voiceStates[info.gamertag] || false;
-      const card = document.createElement('div');
-      card.className = 'participant-card' + (isTalking ? ' talking' : '');
-      const volPct = Math.round(info.volume * 100);
-      const volIcon = info.isSelf ? '' : (info.volume === 0 ? '🔇' : info.volume < 0.3 ? '🔉' : '🔊');
-      const distText = info.isSelf ? '' : `<span class="p-dist">${info.distance}m</span>`;
-      card.innerHTML = `
-        <div class="p-avatar">
-          <img src="${info.skinUrl}" alt="${info.gamertag}"
-            onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"/>
-          <div class="p-avatar-fallback" style="display:none">👤</div>
-          ${isTalking ? '<div class="talking-ring"></div>' : ''}
-        </div>
-        <div class="p-info">
-          <span class="p-name">${info.gamertag}${info.isSelf ? ' <span class="you-badge">You</span>' : ''}</span>
-          ${distText}
-        </div>
-        ${!info.isSelf ? `<span class="p-vol">${volIcon}</span>` : ''}
+      const div = document.createElement("div");
+      div.className = "participant";
+
+      const distanceText = info.isSelf ? "" : ` - ${info.distance}m`;
+      const volumeIcon =
+        info.volume === 0 ? "🔇" : info.volume < 0.3 ? "🔉" : "🔊";
+
+      div.innerHTML = `
+        <img 
+          src="${info.skinUrl}" 
+          alt="${info.gamertag}" 
+          class="participant-skin"
+          onerror="this.style.display='none'; this.nextElementSibling.style.display='inline';"
+        />
+        <span class="participant-icon" style="display:none;">👤</span>
+        <span class="participant-name">${info.gamertag}${
+        info.isSelf ? " (You)" : ""
+      }${distanceText}</span>
+        ${
+          !info.isSelf
+            ? `<span class="volume-indicator">${volumeIcon}</span>`
+            : ""
+        }
       `;
-      el.appendChild(card);
+
+      this.elements.participantsList.appendChild(div);
     });
   }
 
-  async populateMicSelector() {
-    const el = this.els.micSelector;
-    if (!el) return;
-    const inputs = await MicrophoneManager.getAudioInputDevices();
-    el.innerHTML = '';
-    inputs.forEach((d, i) => {
-      const opt = document.createElement('option');
-      opt.value = d.deviceId;
-      opt.textContent = d.label || `Microphone ${i+1}`;
-      el.appendChild(opt);
-    });
+  getGamertag() {
+    return this.elements.gamertagInput.value.trim();
   }
 
-  async populateOutputSelector() {
-    const el = this.els.outputSelector;
-    if (!el) return;
-    const outputs = await MicrophoneManager.getAudioOutputDevices();
-    if (outputs.length === 0) {
-      el.innerHTML = '<option value="">Default Output</option>';
+  getRoomUrl() {
+    return this.elements.roomUrlInput.value.trim();
+  }
+
+  // NUEVO: Poblar el selector de micrófonos
+  async populateMicrophoneSelector() {
+    if (!this.elements.micSelector) {
+      console.error("❌ Mic selector element not found");
       return;
     }
-    el.innerHTML = '';
-    const def = document.createElement('option');
-    def.value = '';
-    def.textContent = 'Default Output';
-    el.appendChild(def);
-    outputs.forEach((d, i) => {
-      const opt = document.createElement('option');
-      opt.value = d.deviceId;
-      opt.textContent = d.label || `Speaker ${i+1}`;
-      el.appendChild(opt);
-    });
-  }
 
-  getGamertag() { return this.els.gamertagInput?.value.trim() || ''; }
-  getRoomUrl() { return this.els.roomUrlInput?.value.trim() || ''; }
-  isPCDevice() { return this.isPC; }
+    try {
+      // IMPORTANTE: Solicitar permisos de micrófono primero si no los tenemos
+      // Esto asegura que enumerateDevices() devuelva los labels reales
+      try {
+        // Pedir un stream temporal solo para asegurar que tenemos permisos
+        const tempStream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+        });
+        // Detenerlo inmediatamente, solo lo necesitábamos para los permisos
+        tempStream.getTracks().forEach((track) => track.stop());
+        console.log("✓ Microphone permissions confirmed");
+      } catch (permError) {
+        console.warn("⚠️ Could not get temporary mic access:", permError);
+      }
+
+      // Ahora sí, enumerar dispositivos - deberían tener labels
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const audioInputs = devices.filter(
+        (device) => device.kind === "audioinput"
+      );
+
+      console.log(`🎤 Found ${audioInputs.length} audio input devices:`);
+      audioInputs.forEach((device, index) => {
+        console.log(
+          `  [${index}] ${
+            device.label || "Unnamed"
+          } (${device.deviceId.substring(0, 20)}...)`
+        );
+      });
+
+      this.elements.micSelector.innerHTML = "";
+
+      if (audioInputs.length === 0) {
+        this.elements.micSelector.innerHTML =
+          '<option value="">No microphones found</option>';
+        this.elements.micSelector.disabled = true;
+        return;
+      }
+
+      // Agregar una opción para cada dispositivo
+      audioInputs.forEach((device, index) => {
+        const option = document.createElement("option");
+        option.value = device.deviceId;
+
+        // Usar el label del dispositivo o un nombre genérico
+        let label = device.label || `Microphone ${index + 1}`;
+
+        // Si el label es muy largo, truncarlo
+        if (label.length > 50) {
+          label = label.substring(0, 47) + "...";
+        }
+
+        option.textContent = label;
+
+        // Marcar como seleccionado el dispositivo "default" o el primero
+        if (device.deviceId === "default" || index === 0) {
+          option.selected = true;
+        }
+
+        this.elements.micSelector.appendChild(option);
+      });
+
+      this.elements.micSelector.disabled = false;
+      console.log(`✓ Loaded ${audioInputs.length} microphones into selector`);
+
+      // Si solo hay un micrófono, mostrar mensaje informativo
+      if (audioInputs.length === 1) {
+        console.log(
+          `ℹ️ Only one microphone detected. If you have multiple microphones, make sure they are connected and recognized by your system.`
+        );
+      }
+    } catch (error) {
+      console.error("❌ Error populating microphone selector:", error);
+      this.elements.micSelector.innerHTML =
+        '<option value="">Error loading microphones</option>';
+      this.elements.micSelector.disabled = true;
+    }
+  }
+  isPCDevice() {
+    return this.isPC;
+  }
 }
 
 // =====================================================
-// CLASS: VoiceChatApp (Main)
+// CLASE PRINCIPAL: VoiceChatApp
+// Coordina todos los componentes
 // =====================================================
 class VoiceChatApp {
   constructor() {
@@ -894,21 +1761,13 @@ class VoiceChatApp {
     this.participantsManager = new ParticipantsManager();
     this.distanceCalculator = new DistanceCalculator(20);
     this.voiceDetector = null;
-    this.ws = null;
-    this.currentGamertag = '';
-    this.heartbeatInterval = null;
-    this.voiceStates = {};
-    this.micMode = 'open'; // 'open' | 'ptt'
-
     this.webrtc = new WebRTCManager(
       this.participantsManager,
       this.audioEffects,
       null,
-      (gt) => this._onTrackReceived(gt)
+      (participant) => this.onTrackReceived(participant)
     );
-
-    this.pushToTalk = new PushToTalkManager(this.micManager, this.webrtc);
-
+    this.pushToTalk = new PushToTalkManager(this.micManager, this.webrtc); // NUEVO: pasar webrtc
     this.minecraft = new MinecraftIntegration(
       this.participantsManager,
       this.audioEffects,
@@ -920,346 +1779,724 @@ class VoiceChatApp {
     this.webrtc.minecraft = this.minecraft;
     this.minecraft.setPushToTalkManager(this.pushToTalk);
 
-    this.minecraft.setOnMuteChange(() => this._updateUI());
-    this.minecraft.setOnDeafenChange(() => this._updateUI());
+    // Re-apply all volumes when output slider moves
+    this.ui.setOnOutputVolumeChange(() => {
+      this.participantsManager.forEach((p) => {
+        if (!p.isSelf) p.updateVolume(p.volume / Math.max(0.001, p.customVolume));
+      });
+    });
 
+    // Callbacks para mute y deafen
+    this.minecraft.setOnMuteChange((isMuted) => {
+      console.log(
+        `🎮 Minecraft mute changed: ${isMuted ? "MUTED" : "UNMUTED"}`
+      );
+      this.updateUI();
+    });
+
+    this.minecraft.setOnDeafenChange((isDeafened) => {
+      console.log(
+        `🎮 Minecraft deafen changed: ${isDeafened ? "DEAFENED" : "UNDEAFENED"}`
+      );
+      this.updateUI();
+    });
+
+    // NUEVO: Callback para cambios de Push-to-Talk
     this.pushToTalk.setOnTalkingChange((isTalking) => {
-      if (this.ws?.readyState === 1) {
-        this.ws.send(JSON.stringify({
-          type: 'ptt-status',
-          gamertag: this.currentGamertag,
-          isTalking,
-          isMuted: !isTalking
-        }));
+      // Notificar al servidor sobre el estado de habla
+      if (this.ws && this.ws.readyState === 1) {
+        this.ws.send(
+          JSON.stringify({
+            type: "ptt-status",
+            gamertag: this.currentGamertag,
+            isTalking: isTalking,
+            isMuted: !isTalking, // Si NO está hablando, está muteado
+          })
+        );
+
+        console.log(`📡 PTT status sent: ${isTalking ? "TALKING" : "MUTED"}`);
       }
     });
+
+    this.ws = null;
+    this.currentGamertag = "";
+    this.heartbeatInterval = null;
   }
 
   async init() {
-    this._checkHTTPS();
+    // NUEVO: Validar HTTPS (requerido para getUserMedia en móviles)
+    this.checkHTTPS();
+
     await this.audioEffects.init();
-    this._setupEventListeners();
-    this._setupPTT();
-    console.log('✓ EnviroVoice initialized');
+    this.setupEventListeners();
+    this.setupPushToTalk();
+    console.log("✓ EnviroVoice initialized");
   }
 
-  _checkHTTPS() {
-    const isLocal = ['localhost', '127.0.0.1', ''].includes(window.location.hostname);
-    if (!isLocal && window.location.protocol !== 'https:') {
-      const bar = document.createElement('div');
-      bar.className = 'https-warning';
-      bar.textContent = '⚠️ Not using HTTPS — microphone may not work on mobile';
-      document.body.prepend(bar);
+  // NUEVO: Verificar si estamos en HTTPS
+  checkHTTPS() {
+    const isLocalhost =
+      window.location.hostname === "localhost" ||
+      window.location.hostname === "127.0.0.1" ||
+      window.location.hostname === "";
+
+    const isHTTPS = window.location.protocol === "https:";
+
+    if (!isHTTPS && !isLocalhost) {
+      console.warn(
+        "⚠️ Not using HTTPS - Microphone may not work on mobile devices"
+      );
+
+      // Mostrar advertencia en la UI
+      const warning = document.createElement("div");
+      warning.style.cssText = `
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        background: #f59e0b;
+        color: white;
+        padding: 12px;
+        text-align: center;
+        font-size: 0.9rem;
+        z-index: 9999;
+        font-weight: 600;
+      `;
+      warning.innerHTML =
+        "⚠️ Warning: Not using HTTPS. Microphone may not work on mobile devices.";
+      document.body.prepend(warning);
     }
   }
 
-  _setupEventListeners() {
-    const { els } = this.ui;
-
-    els.gamertagInput?.addEventListener('input', e => {
+  setupEventListeners() {
+    this.ui.elements.gamertagInput.addEventListener("input", (e) => {
       this.currentGamertag = e.target.value.trim();
       this.ui.updateGamertagStatus(this.currentGamertag);
     });
 
-    els.connectBtn?.addEventListener('click', async () => {
-      if (Tone.context.state !== 'running') await Tone.start();
-      this._connectToRoom();
+    this.ui.elements.connectBtn.addEventListener("click", async () => {
+      if (Tone.context.state !== "running") {
+        await Tone.start();
+        console.log("✓ AudioContext activated");
+      }
+      this.connectToRoom();
     });
 
-    els.exitBtn?.addEventListener('click', () => this._exitCall());
-
-    // Mic toggle
-    els.micToggleBtn?.addEventListener('click', () => {
-      const muted = this.micManager.toggleMute();
-      els.micToggleBtn.textContent = muted ? '🔇 Muted' : '🎤 Mic On';
-      els.micToggleBtn.classList.toggle('muted', muted);
-    });
-
-    // Mic selector change
-    els.micSelector?.addEventListener('change', async (e) => {
-      const deviceId = e.target.value;
-      if (!deviceId) return;
-      try {
-        await this.micManager.changeMicrophone(deviceId);
-        if (this.voiceDetector) this.voiceDetector.dispose();
-        const stream = this.micManager.getStream();
-        if (stream) this._initVoiceDetector(stream);
-        await this.webrtc.updateMicStream?.(this.micManager.getStream());
-      } catch(e) { console.error('Mic change error:', e); }
-    });
-
-    // Output selector change
-    els.outputSelector?.addEventListener('change', (e) => {
-      const deviceId = e.target.value;
-      this.webrtc.setOutputDevice(deviceId);
-      this.participantsManager.setOutputDevice(deviceId);
-    });
-
-    // Hold-to-Talk button
-    this._setupHoldToTalk();
+    this.ui.elements.exitBtn.addEventListener("click", () => this.exitCall());
   }
 
-  _setupHoldToTalk() {
-    const btn = this.ui.els.holdToTalkBtn;
-    if (!btn) return;
+  // NUEVO: Configurar Push-to-Talk
+  setupPushToTalk() {
+    if (!this.ui.isPCDevice()) {
+      console.log("📱 Mobile device detected - Push-to-Talk disabled");
+      return;
+    }
 
-    const start = (e) => {
-      e.preventDefault();
-      if (this.micManager.isMicMuted()) return;
-      if (this.micMode !== 'ptt') return;
-      btn.classList.add('pressing');
-      this.webrtc.peerConnections.forEach(pc =>
-        pc.getSenders().forEach(s => { if (s.track) s.track.enabled = true; })
-      );
-      if (this.ws?.readyState === 1) {
-        this.ws.send(JSON.stringify({ type: 'ptt-status', gamertag: this.currentGamertag, isTalking: true, isMuted: false }));
-      }
-    };
-
-    const stop = (e) => {
-      e.preventDefault();
-      if (this.micMode !== 'ptt') return;
-      btn.classList.remove('pressing');
-      this.webrtc.peerConnections.forEach(pc =>
-        pc.getSenders().forEach(s => { if (s.track) s.track.enabled = false; })
-      );
-      if (this.ws?.readyState === 1) {
-        this.ws.send(JSON.stringify({ type: 'ptt-status', gamertag: this.currentGamertag, isTalking: false, isMuted: true }));
-      }
-    };
-
-    btn.addEventListener('mousedown', start);
-    btn.addEventListener('mouseup', stop);
-    btn.addEventListener('mouseleave', stop);
-    btn.addEventListener('touchstart', start, { passive: false });
-    btn.addEventListener('touchend', stop, { passive: false });
-    btn.addEventListener('touchcancel', stop, { passive: false });
-  }
-
-  _setupPTT() {
-    const { els } = this.ui;
-    if (!this.ui.isPCDevice()) return;
-
-    let listeningKey = false;
+    let isListeningForKey = false;
     let keyListener = null;
 
-    // PTT enable toggle
-    els.pttToggle?.addEventListener('change', (e) => {
+    // Toggle de PTT
+    this.ui.elements.pttToggle.addEventListener("change", (e) => {
       const enabled = e.target.checked;
-      this.micMode = enabled ? 'ptt' : 'open';
       this.pushToTalk.setEnabled(enabled);
-      if (els.pttKeyRow) els.pttKeyRow.style.display = enabled ? 'flex' : 'none';
-      if (els.holdToTalkContainer) {
-        els.holdToTalkContainer.style.display = enabled ? 'flex' : 'none';
+
+      console.log("🎮 PTT Toggle:", enabled);
+      console.log(
+        "🎮 pttKeySelector element:",
+        this.ui.elements.pttKeySelector
+      );
+
+      if (this.ui.elements.pttKeySelector) {
+        this.ui.elements.pttKeySelector.style.display = enabled
+          ? "flex"
+          : "none";
+        console.log("✓ Selector display set to:", enabled ? "flex" : "none");
+      } else {
+        console.error("❌ pttKeySelector element not found!");
       }
-      // Update open-mic mode label
-      if (els.pttModeOpen) {
-        els.pttModeOpen.classList.toggle('active', !enabled);
+
+      // Enviar estado inmediatamente cuando cambia el toggle
+      if (this.ws && this.ws.readyState === 1) {
+        const isTalking = enabled ? false : true;
+        const isMuted = enabled ? true : false;
+
+        this.ws.send(
+          JSON.stringify({
+            type: "ptt-status",
+            gamertag: this.currentGamertag,
+            isTalking: isTalking,
+            isMuted: isMuted,
+          })
+        );
+
+        console.log(
+          `📡 PTT toggle changed: ${
+            enabled ? "ENABLED (muted)" : "DISABLED (talking)"
+          }`
+        );
       }
     });
 
-    // Open mic mode toggle (always-on)
-    els.pttModeOpen?.addEventListener('click', () => {
-      if (els.pttToggle) els.pttToggle.checked = false;
-      this.micMode = 'open';
-      this.pushToTalk.setEnabled(false);
-      if (els.pttKeyRow) els.pttKeyRow.style.display = 'none';
-      if (els.holdToTalkContainer) els.holdToTalkContainer.style.display = 'none';
-      els.pttModeOpen.classList.add('active');
-    });
+    // Selector de tecla
+    this.ui.elements.pttKeyInput.addEventListener("click", () => {
+      if (isListeningForKey) return; // Ya está escuchando
 
-    // Key picker
-    els.pttKeyBtn?.addEventListener('click', () => {
-      if (listeningKey) return;
-      listeningKey = true;
-      els.pttKeyBtn.textContent = 'Press any key...';
-      els.pttKeyBtn.classList.add('listening');
+      isListeningForKey = true;
+      this.ui.elements.pttKeyInput.classList.add("listening");
+      this.ui.elements.pttKeyInput.textContent = "Press any key...";
+      this.ui.elements.pttKeyDisplay.textContent = "Listening...";
 
-      if (keyListener) document.removeEventListener('keydown', keyListener);
+      // Remover listener anterior si existe
+      if (keyListener) {
+        document.removeEventListener("keydown", keyListener);
+      }
+
+      // Crear nuevo listener
       keyListener = (e) => {
         e.preventDefault();
         e.stopPropagation();
-        const display = this._getKeyDisplay(e);
-        this.pushToTalk.setKey(e.code, display);
-        els.pttKeyBtn.textContent = display;
-        els.pttKeyBtn.classList.remove('listening');
-        if (els.pttKeyDisplay) els.pttKeyDisplay.textContent = `Hold ${display} to talk`;
-        document.removeEventListener('keydown', keyListener);
+
+        const key = e.code;
+        const display = this.getKeyDisplay(e);
+
+        this.pushToTalk.setKey(key, display);
+        this.ui.elements.pttKeyInput.textContent = display;
+        this.ui.elements.pttKeyDisplay.textContent = `Press and hold ${display} to talk`;
+        this.ui.elements.pttKeyInput.classList.remove("listening");
+
+        // Limpiar
+        document.removeEventListener("keydown", keyListener);
         keyListener = null;
-        listeningKey = false;
+        isListeningForKey = false;
       };
-      document.addEventListener('keydown', keyListener);
+
+      document.addEventListener("keydown", keyListener);
     });
 
-    document.addEventListener('keydown', e => { if (!listeningKey) this.pushToTalk.handleKeyDown(e); });
-    document.addEventListener('keyup', e => { if (!listeningKey) this.pushToTalk.handleKeyUp(e); });
+    // Event listeners para keydown/keyup (PTT funcional)
+    document.addEventListener("keydown", (e) => {
+      // No procesar si estamos seleccionando una tecla
+      if (isListeningForKey) return;
+      this.pushToTalk.handleKeyDown(e);
+    });
+
+    document.addEventListener("keyup", (e) => {
+      // No procesar si estamos seleccionando una tecla
+      if (isListeningForKey) return;
+      this.pushToTalk.handleKeyUp(e);
+    });
+
+    console.log("✓ Push-to-Talk initialized");
   }
 
-  _getKeyDisplay(e) {
-    if (e.key.length === 1) return e.key.toUpperCase();
-    const map = { Space: 'SPACE', ShiftLeft: 'L-SHIFT', ShiftRight: 'R-SHIFT', ControlLeft: 'L-CTRL', ControlRight: 'R-CTRL', AltLeft: 'L-ALT', AltRight: 'R-ALT', Tab: 'TAB', Enter: 'ENTER' };
-    return map[e.code] || e.code;
+  // NUEVO: Obtener nombre legible de la tecla
+  getKeyDisplay(event) {
+    if (event.key.length === 1) return event.key.toUpperCase();
+
+    const keyMap = {
+      Space: "SPACE",
+      ShiftLeft: "LEFT SHIFT",
+      ShiftRight: "RIGHT SHIFT",
+      ControlLeft: "LEFT CTRL",
+      ControlRight: "RIGHT CTRL",
+      AltLeft: "LEFT ALT",
+      AltRight: "RIGHT ALT",
+      Tab: "TAB",
+      CapsLock: "CAPS LOCK",
+      Enter: "ENTER",
+      Backspace: "BACKSPACE",
+    };
+
+    return keyMap[event.code] || event.code;
   }
 
-  async _connectToRoom() {
-    if (!this.currentGamertag) return alert('⚠️ Enter your gamertag');
+  async connectToRoom() {
     const url = this.ui.getRoomUrl();
-    if (!url) return alert('⚠️ Enter a valid room URL');
 
-    this.ui.updateRoomInfo('Connecting...');
-    this.webrtc.closeAllConnections();
-    if (this.ws) this.ws.close();
-
-    try {
-      const micDevice = this.ui.els.micSelector?.value || null;
-      await this.micManager.start(micDevice, 1.0);
-    } catch(e) {
-      console.error('Mic error:', e);
-      alert('❌ Could not access microphone.\n\n' + e.message);
-      this.ui.updateRoomInfo('❌ Microphone error');
+    if (!this.currentGamertag) {
+      alert("⚠️ Enter your gamertag to continue");
+      return;
+    }
+    if (!url) {
+      alert("⚠️ Enter a valid room URL");
       return;
     }
 
-    const stream = this.micManager.getStream();
-    if (stream) this._initVoiceDetector(stream);
+    try {
+      this.ui.updateRoomInfo("Connecting to server...");
 
-    this.webrtc.setGamertag(this.currentGamertag);
-    this.minecraft.setGamertag(this.currentGamertag);
+      this.webrtc.closeAllConnections();
+      if (this.ws) this.ws.close();
 
-    const wsUrl = url.replace(/^http/, 'ws');
-    this.ws = new WebSocket(wsUrl);
-    this.webrtc.setWebSocket(this.ws);
+      // MEJORADO: Mejor manejo de errores al iniciar el micrófono
+      try {
+        await this.micManager.start(1.0);
+      } catch (micError) {
+        console.error("Microphone error:", micError);
+        let userMessage = "❌ Could not access microphone.\n\n";
 
-    this.ws.onopen = () => this._onWsOpen();
-    this.ws.onmessage = (msg) => this._onWsMessage(msg);
-    this.ws.onerror = () => { this.ui.updateRoomInfo('❌ Connection error'); this._exitCall(); };
-    this.ws.onclose = () => this._exitCall();
-  }
+        if (micError.message.includes("doesn't support")) {
+          userMessage += "Your browser doesn't support microphone access.\n\n";
+          userMessage += "Solutions:\n";
+          userMessage += "• Make sure you're using HTTPS (https://...)\n";
+          userMessage += "• Try using Chrome, Firefox, or Safari\n";
+          userMessage += "• If on iPhone/iPad, use Safari (not Chrome)";
+        } else if (micError.message.includes("Permission denied")) {
+          userMessage += "Microphone permission was denied.\n\n";
+          userMessage += "Solutions:\n";
+          userMessage += "• Click the 🔒 icon in the address bar\n";
+          userMessage += "• Allow microphone access\n";
+          userMessage += "• Reload the page and try again";
+        } else {
+          userMessage += micError.message;
+        }
 
-  _initVoiceDetector(stream) {
-    this.voiceDetector = new VoiceDetector(stream, (isTalking, volumeDb) => {
-      if (this.ws?.readyState === 1) {
-        this.ws.send(JSON.stringify({ type: 'voice-detection', gamertag: this.currentGamertag, isTalking, volume: volumeDb }));
+        alert(userMessage);
+        this.ui.updateRoomInfo("❌ Microphone error - Check permissions");
+        return;
       }
-    });
-    this.voiceDetector.setSensitivity('high');
+
+      // Inicializar Voice Detector
+      const micStream = this.micManager.getStream();
+      if (micStream) {
+        this.voiceDetector = new VoiceDetector(
+          micStream,
+          (isTalking, volumeDb) => {
+            if (this.ws && this.ws.readyState === 1) {
+              this.ws.send(
+                JSON.stringify({
+                  type: "voice-detection",
+                  gamertag: this.currentGamertag,
+                  isTalking: isTalking,
+                  volume: volumeDb,
+                })
+              );
+            }
+          }
+        );
+
+        this.voiceDetector.setSensitivity("high");
+      }
+
+      this.webrtc.setGamertag(this.currentGamertag);
+      this.minecraft.setGamertag(this.currentGamertag);
+
+      this.ws = new WebSocket(url.replace("http", "ws"));
+      this.webrtc.setWebSocket(this.ws);
+
+      this.ws.onopen = () => this.onWebSocketOpen();
+      this.ws.onmessage = (msg) => this.onWebSocketMessage(msg);
+      this.ws.onerror = () => this.onWebSocketError();
+      this.ws.onclose = () => this.exitCall();
+    } catch (e) {
+      console.error("Connection error:", e);
+      alert("Error connecting to server: " + e.message);
+      this.ui.updateRoomInfo("❌ Connection error");
+    }
   }
 
-  async _onWsOpen() {
-    this.ui.updateRoomInfo('✅ Connected to voice chat');
-    this.ws.send(JSON.stringify({ type: 'join', gamertag: this.currentGamertag }));
-    this.ws.send(JSON.stringify({ type: 'request-participants' }));
-    this.ws.send(JSON.stringify({ type: 'ptt-status', gamertag: this.currentGamertag, isTalking: true, isMuted: false }));
+  async onWebSocketOpen() {
+    this.ui.updateRoomInfo("✅ Connected to voice chat");
+
+    this.ws.send(
+      JSON.stringify({ type: "join", gamertag: this.currentGamertag })
+    );
+    this.ws.send(JSON.stringify({ type: "request-participants" }));
+
+    // NUEVO: Enviar estado inicial de PTT
+    const isPTTEnabled = this.pushToTalk.isEnabled();
+    const isTalking = isPTTEnabled ? this.pushToTalk.isSpeaking() : true;
+    const isMuted = isPTTEnabled ? !this.pushToTalk.isSpeaking() : false;
+
+    this.ws.send(
+      JSON.stringify({
+        type: "ptt-status",
+        gamertag: this.currentGamertag,
+        isTalking: isTalking,
+        isMuted: isMuted,
+      })
+    );
+
+    console.log(
+      `📡 Initial PTT state sent: ${isTalking ? "TALKING" : "MUTED"}`
+    );
 
     this.ui.showCallControls(true);
     this.participantsManager.add(this.currentGamertag, true);
+    this.updateUI();
 
-    await this.ui.populateMicSelector();
-    await this.ui.populateOutputSelector();
-    this._updateUI();
+    // NUEVO: Cargar lista de micrófonos disponibles
+    await this.ui.populateMicrophoneSelector();
 
+    // NUEVO: Event listener para cambio de micrófono
+    if (this.ui.elements.micSelector) {
+      const micChangeHandler = async (e) => {
+        const deviceId = e.target.value;
+        if (!deviceId) return;
+
+        try {
+          console.log(`🎤 User selected microphone: ${deviceId}`);
+
+          // Cambiar el micrófono
+          await this.micManager.changeMicrophone(deviceId);
+
+          // Reinicializar el voice detector con el nuevo stream
+          if (this.voiceDetector) {
+            this.voiceDetector.dispose();
+          }
+
+          const micStream = this.micManager.getStream();
+          if (micStream) {
+            this.voiceDetector = new VoiceDetector(
+              micStream,
+              (isTalking, volumeDb) => {
+                if (this.ws && this.ws.readyState === 1) {
+                  this.ws.send(
+                    JSON.stringify({
+                      type: "voice-detection",
+                      gamertag: this.currentGamertag,
+                      isTalking: isTalking,
+                      volume: volumeDb,
+                    })
+                  );
+                }
+              }
+            );
+
+            this.voiceDetector.setSensitivity("high");
+          }
+
+          // Reinicializar WebRTC con el nuevo micrófono
+          await this.webrtc.updateMicrophoneStream(micStream);
+
+          console.log("✅ Microphone changed successfully");
+        } catch (error) {
+          console.error("❌ Error changing microphone:", error);
+          alert("Error changing microphone: " + error.message);
+        }
+      };
+
+      // Remover listener anterior si existe
+      this.ui.elements.micSelector.removeEventListener(
+        "change",
+        this.micChangeHandler
+      );
+      this.micChangeHandler = micChangeHandler;
+      this.ui.elements.micSelector.addEventListener(
+        "change",
+        this.micChangeHandler
+      );
+    }
     this.heartbeatInterval = setInterval(() => {
-      if (this.ws?.readyState === 1) this.ws.send(JSON.stringify({ type: 'heartbeat' }));
-    }, 30000);
+      if (this.ws && this.ws.readyState === 1) {
+        this.ws.send(
+          JSON.stringify({ type: "heartbeat", gamertag: this.currentGamertag })
+        );
+      }
+    }, 15000);
   }
 
-  async _onWsMessage(msg) {
+  async onWebSocketMessage(msg) {
     const data = JSON.parse(msg.data);
 
-    if (data.type === 'error') { alert('❌ ' + data.message); return; }
+    if (data.type === "heartbeat") return;
 
-    if (data.type === 'minecraft-update') {
-      if (data.data) this.minecraft.updateData(data.data);
-      if (data.voiceStates) {
-        this.voiceStates = {};
-        data.voiceStates.forEach(vs => { this.voiceStates[vs.gamertag] = vs.isTalking; });
-      }
+    if (data.type === "minecraft-update") {
+      this.minecraft.updateData(data.data);
+
+      // NUEVO: Procesar estados de mute desde Minecraft
       if (data.muteStates) {
-        // handle mute states if needed
+        const myState = data.muteStates.find(
+          (s) => s.gamertag === this.currentGamertag
+        );
+
+        if (myState) {
+          // Actualizar mute si cambió desde Minecraft
+          if (myState.isMuted !== this.minecraft.remoteMuted) {
+            this.minecraft.remoteMuted = myState.isMuted;
+            console.log(
+              `🎮 Minecraft mute changed: ${
+                myState.isMuted ? "MUTED" : "UNMUTED"
+              }`
+            );
+
+            // Si PTT NO está activo, aplicar el cambio inmediatamente
+            if (!this.pushToTalk || !this.pushToTalk.isEnabled()) {
+              this.micManager.setEnabled(!myState.isMuted);
+            }
+          }
+
+          // Actualizar volumen de micrófono si cambió
+          if (myState.micVolume !== undefined) {
+            const currentVolume = this.audioEffects.inputNode?.gain.value || 1;
+            if (Math.abs(currentVolume - myState.micVolume) > 0.01) {
+              console.log(
+                `🎚️ Minecraft volume changed: ${(
+                  myState.micVolume * 100
+                ).toFixed(0)}%`
+              );
+              this.audioEffects.updateVolume(
+                myState.micVolume,
+                this.webrtc?.peerConnections
+              );
+            }
+          }
+
+          // Actualizar deafen
+          if (myState.isDeafened !== this.minecraft.remoteDeafened) {
+            this.minecraft.remoteDeafened = myState.isDeafened;
+            console.log(
+              `🔇 Minecraft deafen changed: ${
+                myState.isDeafened ? "DEAFENED" : "UNDEAFENED"
+              }`
+            );
+
+            // Si está deafened, mutear también
+            if (myState.isDeafened) {
+              this.minecraft.remoteMuted = true;
+              if (!this.pushToTalk || !this.pushToTalk.isEnabled()) {
+                this.micManager.setEnabled(false);
+              }
+            }
+          }
+        }
       }
-      this._updateUI();
+
+      this.updateUI();
       return;
     }
 
-    if (data.type === 'ptt-update') {
-      this.voiceStates[data.gamertag] = data.isTalking;
-      this._updateUI();
-      return;
-    }
+    await this.handleSignaling(data);
+  }
 
-    // Signaling
-    if (data.type === 'join' && data.gamertag !== this.currentGamertag) {
-      this.participantsManager.add(data.gamertag, false);
-      if (!this.webrtc.getPeerConnection(data.gamertag)) {
-        const pc = await this.webrtc.createPeerConnection(data.gamertag);
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        this.ws.send(JSON.stringify({ type: 'offer', offer, from: this.currentGamertag, to: data.gamertag }));
+  async handleSignaling(data) {
+    try {
+      if (data.type === "join" && data.gamertag !== this.currentGamertag) {
+        console.log(`👋 ${data.gamertag} joined the room`);
+        this.participantsManager.add(data.gamertag, false);
+
+        if (!this.webrtc.getPeerConnection(data.gamertag)) {
+          const pc = await this.webrtc.createPeerConnection(data.gamertag);
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+
+          this.ws.send(
+            JSON.stringify({
+              type: "offer",
+              offer: offer,
+              from: this.currentGamertag,
+              to: data.gamertag,
+            })
+          );
+        }
+        this.updateUI();
+      } else if (data.type === "leave") {
+        console.log(`👋 ${data.gamertag} left the room`);
+        this.participantsManager.remove(data.gamertag);
+        this.webrtc.closePeerConnection(data.gamertag);
+
+        // Reconectar a todos cuando alguien sale
+        console.log(
+          "⚡ Triggering full reconnection due to participant leaving"
+        );
+        await this.webrtc.reconnectAllPeers();
+
+        this.updateUI();
+      } else if (data.type === "offer" && data.to === this.currentGamertag) {
+        console.log(`📨 Received offer from ${data.from}`);
+        this.participantsManager.add(data.from, false);
+
+        const pc = await this.webrtc.createPeerConnection(data.from);
+
+        if (
+          pc.signalingState === "stable" ||
+          pc.signalingState === "have-local-offer"
+        ) {
+          await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+
+          this.ws.send(
+            JSON.stringify({
+              type: "answer",
+              answer: answer,
+              from: this.currentGamertag,
+              to: data.from,
+            })
+          );
+          console.log(`📤 Sent answer to ${data.from}`);
+        }
+        this.updateUI();
+      } else if (data.type === "answer" && data.to === this.currentGamertag) {
+        console.log(`📨 Received answer from ${data.from}`);
+        const pc = this.webrtc.getPeerConnection(data.from);
+
+        if (pc && pc.signalingState === "have-local-offer") {
+          await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+          console.log(`✓ Answer applied for ${data.from}`);
+        }
+      } else if (
+        data.type === "ice-candidate" &&
+        data.to === this.currentGamertag
+      ) {
+        const pc = this.webrtc.getPeerConnection(data.from);
+        if (pc && data.candidate) {
+          await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+        }
+      } else if (data.type === "participants-list") {
+        console.log(`📋 Received participants list: ${data.list.join(", ")}`);
+        data.list.forEach((gt) => {
+          if (gt !== this.currentGamertag) {
+            this.participantsManager.add(gt, false);
+          }
+        });
+        this.updateUI();
       }
-      this._updateUI();
-    } else if (data.type === 'leave') {
-      this.participantsManager.remove(data.gamertag);
-      this.webrtc.closePeerConnection(data.gamertag);
-      await this.webrtc.reconnectAllPeers();
-      this._updateUI();
-    } else if (data.type === 'offer' && data.to === this.currentGamertag) {
-      this.participantsManager.add(data.from, false);
-      const pc = await this.webrtc.createPeerConnection(data.from);
-      if (pc.signalingState === 'stable' || pc.signalingState === 'have-local-offer') {
-        await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        this.ws.send(JSON.stringify({ type: 'answer', answer, from: this.currentGamertag, to: data.from }));
-      }
-      this._updateUI();
-    } else if (data.type === 'answer' && data.to === this.currentGamertag) {
-      const pc = this.webrtc.getPeerConnection(data.from);
-      if (pc?.signalingState === 'have-local-offer') {
-        await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
-      }
-    } else if (data.type === 'ice-candidate' && data.to === this.currentGamertag) {
-      const pc = this.webrtc.getPeerConnection(data.from);
-      if (pc && data.candidate) await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-    } else if (data.type === 'participants-list') {
-      data.list.forEach(gt => { if (gt !== this.currentGamertag) this.participantsManager.add(gt, false); });
-      this._updateUI();
+    } catch (e) {
+      console.error("Error in signaling:", e);
     }
   }
 
-  _onTrackReceived(gt) {
-    this._updateUI();
+  onWebSocketError() {
+    this.ui.updateRoomInfo("❌ Connection error");
+    this.exitCall();
   }
 
-  _exitCall() {
-    if (this.ws?.readyState === 1) {
-      this.ws.send(JSON.stringify({ type: 'leave', gamertag: this.currentGamertag }));
+  onTrackReceived(participant) {
+    console.log(`📍 Audio track received for ${participant.gamertag}`);
+    this.updateUI();
+  }
+
+  exitCall() {
+    if (this.ws && this.ws.readyState === 1) {
+      this.ws.send(
+        JSON.stringify({ type: "leave", gamertag: this.currentGamertag })
+      );
     }
+
     this.webrtc.closeAllConnections();
-    if (this.ws) { this.ws.close(); this.ws = null; }
-    if (this.voiceDetector) { this.voiceDetector.dispose(); this.voiceDetector = null; }
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+
+    if (this.voiceDetector) {
+      this.voiceDetector.dispose();
+      this.voiceDetector = null;
+    }
+
     this.micManager.stop();
     this.participantsManager.clear();
-    if (this.heartbeatInterval) { clearInterval(this.heartbeatInterval); this.heartbeatInterval = null; }
+
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+    }
+
     this.ui.showCallControls(false);
-    this.ui.updateRoomInfo('');
-    this._updateUI();
+    this.ui.updateRoomInfo("");
+    this.updateUI();
   }
 
-  _updateUI() {
+  updateUI() {
     this.ui.updateGameStatus(this.minecraft.isInGame());
-    this.ui.updateParticipantsList(this.participantsManager.getAll(), this.voiceStates);
+    this.ui.updateParticipantsList(this.participantsManager.getAll());
+  }
+
+  // Métodos de debug
+  debugAudioState() {
+    console.log("=== AUDIO STATE DEBUG ===");
+    this.participantsManager.forEach((p, name) => {
+      const info = {
+        distance: p.distance.toFixed(1),
+        volume: p.volume.toFixed(2),
+        customVolume: p.customVolume.toFixed(2),
+        hasAudioElement: !!p.audioElement,
+        audioVolume: p.audioElement?.volume.toFixed(2),
+      };
+      console.log(`${name}:`, info);
+    });
+
+    const audioElements = document.querySelectorAll("audio");
+    console.log(`📻 Audio elements in DOM: ${audioElements.length}`);
+    audioElements.forEach((el) => {
+      console.log(
+        `  - ${el.id || "no ID"}: paused=${
+          el.paused
+        }, volume=${el.volume.toFixed(2)}, srcObject=${!!el.srcObject}`
+      );
+    });
+
+    console.log("========================");
+  }
+
+  testAudioOutput() {
+    console.log("🔊 Generating test tone of 440Hz for 2 seconds...");
+
+    const audioContext = Tone.context.rawContext || Tone.context._context;
+    const oscillator = audioContext.createOscillator();
+    const gainNode = audioContext.createGain();
+
+    oscillator.type = "sine";
+    oscillator.frequency.value = 440;
+    gainNode.gain.value = 0.3;
+
+    oscillator.connect(gainNode);
+    gainNode.connect(audioContext.destination);
+
+    oscillator.start();
+    setTimeout(() => {
+      oscillator.stop();
+      console.log("✓ Test tone finished");
+    }, 2000);
+  }
+
+  diagnoseWebRTC() {
+    console.log("=== WEBRTC DIAGNOSIS ===");
+
+    this.webrtc.forEach((pc, name) => {
+      console.log(`\n👤 ${name}:`);
+      console.log(
+        `  Estado: ${pc.connectionState} | ICE: ${pc.iceConnectionState}`
+      );
+
+      const receivers = pc.getReceivers();
+      console.log(`  📥 Receivers: ${receivers.length}`);
+      receivers.forEach((receiver, i) => {
+        const track = receiver.track;
+        if (track) {
+          console.log(
+            `    [${i}] ${track.kind}: enabled=${track.enabled}, readyState=${track.readyState}, muted=${track.muted}`
+          );
+        }
+      });
+
+      const senders = pc.getSenders();
+      console.log(`  📤 Senders: ${senders.length}`);
+      senders.forEach((sender, i) => {
+        const track = sender.track;
+        if (track) {
+          console.log(
+            `    [${i}] ${track.kind}: enabled=${track.enabled}, readyState=${track.readyState}`
+          );
+        }
+      });
+    });
+
+    console.log("\n======================");
   }
 }
 
 // =====================================================
-// INIT
+// INICIALIZACIÓN
 // =====================================================
 let app;
-window.addEventListener('DOMContentLoaded', async () => {
+
+window.addEventListener("DOMContentLoaded", async () => {
   app = new VoiceChatApp();
   await app.init();
-  window.debugAudio = () => {
-    console.log('=== PARTICIPANTS ===');
-    app.participantsManager.forEach((p, gt) => console.log(gt, { dist: p.distance, vol: p.volume }));
-  };
+
+  window.debugAudio = () => app.debugAudioState();
+  window.testAudio = () => app.testAudioOutput();
+  window.diagnoseWebRTC = () => app.diagnoseWebRTC();
 });
