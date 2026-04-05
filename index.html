@@ -558,13 +558,23 @@
 
     <!-- CALL CONTROLS -->
     <div id="callControls" style="display:none">
-
+          
       <!-- Status -->
       <div class="game-status-bar" id="gameStatus">
         <span class="status-dot warn"></span>
         <span>Not connected to Minecraft</span>
       </div>
 
+      <div class="volume-control">
+  <label>🔊 Output Volume</label>
+  <div class="volume-slider-container">
+    <span>0%</span>
+    <input type="range" id="outputVolumeSlider" class="slider"
+           min="0" max="200" value="100" step="1">
+    <span id="outputVolumeLabel">100%</span>
+  </div>
+</div>
+      
       <!-- Mic + Exit -->
       <div class="controls-grid">
         <button id="micToggleBtn" class="ctrl-btn">
